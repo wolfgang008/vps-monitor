@@ -1,0 +1,9 @@
+*.tsv
+token
+chat_id
+server_name
+interface
+.tmp/
+.idea/
+.vscode/
+.DS_Store
