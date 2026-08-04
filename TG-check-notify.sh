@@ -736,8 +736,12 @@ uninstall_app() {
     systemctl stop vps-monitor-{collect,report,monthly}.service >/dev/null 2>&1 || true
     rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,monthly}.{service,timer} "$BIN_PATH"
     rm -rf -- "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
-    getent passwd "$SERVICE_USER" >/dev/null && userdel "$SERVICE_USER" >/dev/null 2>&1 || true
-    getent group "$SERVICE_USER" >/dev/null && groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
+    if getent passwd "$SERVICE_USER" >/dev/null; then
+        userdel "$SERVICE_USER" >/dev/null 2>&1 || true
+    fi
+    if getent group "$SERVICE_USER" >/dev/null; then
+        groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
+    fi
     systemctl daemon-reload
     success "程序、Token 和统计文件已全部删除。"
 }
