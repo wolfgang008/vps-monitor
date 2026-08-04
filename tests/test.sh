@@ -11,7 +11,7 @@ trap 'rm -rf -- "$TEST_DIR"' EXIT
 DATA_DIR="$TEST_DIR"
 STATE_FILE="${DATA_DIR}/state.tsv"
 SAMPLES_FILE="${DATA_DIR}/samples.tsv"
-export SERVER_NAME="日本Acck"
+export SERVER_NAME="测试服务器"
 
 assert_equal() {
     local expected="$1" actual="$2" label="$3"
@@ -21,11 +21,11 @@ assert_equal() {
     fi
 }
 
-expected_two_hour=$'日本Acck\n进站速度: 10.15 MB/s\n出站速度: 10.07 MB/s\n总流量: 2.51 TB\nCPU利用率: 29%'
+expected_two_hour=$'测试服务器\n进站速度: 10.15 MB/s\n出站速度: 10.07 MB/s\n总流量: 2.51 TB\nCPU利用率: 29%'
 actual_two_hour="$(format_two_hour_message 76629934080 76025954304 29 100 2759774185718)"
 assert_equal "$expected_two_hour" "$actual_two_hour" "two-hour message format"
 
-expected_month=$'日本Acck 2026年8月流量报告\n进站流量: 1.42 TB\n出站流量: 1.09 TB\n总流量: 2.51 TB\n平均CPU利用率: 29%'
+expected_month=$'测试服务器 2026年8月流量报告\n进站流量: 1.42 TB\n出站流量: 1.09 TB\n总流量: 2.51 TB\n平均CPU利用率: 29%'
 actual_month="$(format_month_message 2026-08 1561306511442 1198467674276 29 100)"
 assert_equal "$expected_month" "$actual_month" "monthly message format"
 
