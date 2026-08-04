@@ -21,6 +21,12 @@ assert_equal() {
     fi
 }
 
+is_telegram_uid "123456789" || { printf 'FAIL: valid Telegram UID rejected\n' >&2; exit 1; }
+if is_telegram_uid "@example" || is_telegram_uid "012345" || is_telegram_uid "-100123"; then
+    printf 'FAIL: invalid Telegram UID accepted\n' >&2
+    exit 1
+fi
+
 expected_two_hour=$'测试服务器\n进站速度: 10.15 MB/s\n出站速度: 10.07 MB/s\n总流量: 2.51 TB\nCPU利用率: 29%'
 actual_two_hour="$(format_two_hour_message 76629934080 76025954304 29 100 2759774185718)"
 assert_equal "$expected_two_hour" "$actual_two_hour" "two-hour message format"
