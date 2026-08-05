@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Bash syntax
         run: bash -n TG-check-notify.sh tests/test.sh
-      - name: Release checksum
+      - name: Script checksum
         run: sha256sum --check TG-check-notify.sh.sha256
       - name: Install ShellCheck
         run: |

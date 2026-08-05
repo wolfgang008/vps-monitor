@@ -49,17 +49,28 @@ if version_is_newer 1.5.0 1.5.0 || version_is_newer 1.4.9 1.5.0; then
     exit 1
 fi
 
-release_script="${TEST_DIR}/release-script"
-release_checksum="${TEST_DIR}/release-checksum"
-printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="9.8.7"\n' > "$release_script"
-printf '%s  TG-check-notify.sh\n' "$(sha256sum "$release_script" | awk '{print $1}')" > "$release_checksum"
-verify_release_script "$release_script" "$release_checksum" \
-    || { printf 'FAIL: valid release checksum was rejected\n' >&2; exit 1; }
-printf '%064d  TG-check-notify.sh\n' 0 > "$release_checksum"
-if verify_release_script "$release_script" "$release_checksum"; then
-    printf 'FAIL: invalid release checksum was accepted\n' >&2
+downloaded_script="${TEST_DIR}/downloaded-script"
+downloaded_checksum="${TEST_DIR}/downloaded-checksum"
+printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="9.8.7"\n' > "$downloaded_script"
+printf '%s  TG-check-notify.sh\n' "$(sha256sum "$downloaded_script" | awk '{print $1}')" > "$downloaded_checksum"
+verify_downloaded_script "$downloaded_script" "$downloaded_checksum" \
+    || { printf 'FAIL: valid download checksum was rejected\n' >&2; exit 1; }
+printf '%064d  TG-check-notify.sh\n' 0 > "$downloaded_checksum"
+if verify_downloaded_script "$downloaded_script" "$downloaded_checksum"; then
+    printf 'FAIL: invalid download checksum was accepted\n' >&2
     exit 1
 fi
+
+archive_source="${TEST_DIR}/${GITHUB_ARCHIVE_ROOT}"
+mkdir -p "$archive_source"
+cp -- "$downloaded_script" "${archive_source}/TG-check-notify.sh"
+printf '%s  TG-check-notify.sh\n' \
+    "$(sha256sum "$downloaded_script" | awk '{print $1}')" > "${archive_source}/TG-check-notify.sh.sha256"
+tar -czf "${TEST_DIR}/main.tar.gz" -C "$TEST_DIR" "$GITHUB_ARCHIVE_ROOT"
+extract_verified_main_archive "${TEST_DIR}/main.tar.gz" \
+    "${TEST_DIR}/archive-script" "${TEST_DIR}/archive-checksum" \
+    || { printf 'FAIL: valid GitHub main archive was rejected\n' >&2; exit 1; }
+assert_equal "9.8.7" "$(script_version "${TEST_DIR}/archive-script")" "GitHub main archive script"
 
 login_epoch="$(date -d '2026-08-05 12:34:56 UTC' +%s)"
 login_time="$(date -d "@${login_epoch}" '+%F %T %Z')"

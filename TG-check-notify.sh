@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -23,8 +23,10 @@ LOCK_FILE="${DATA_DIR}/monitor.lock"
 LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
 PAM_SSHD_FILE="${VPS_MONITOR_PAM_SSHD_FILE:-/etc/pam.d/sshd}"
 PAM_MARKER="# vps-monitor SSH login alert"
-RELEASE_SCRIPT_URL="https://github.com/wolfgang008/vps-monitor/releases/latest/download/TG-check-notify.sh"
-RELEASE_CHECKSUM_URL="https://github.com/wolfgang008/vps-monitor/releases/latest/download/TG-check-notify.sh.sha256"
+GITHUB_REPOSITORY="wolfgang008/vps-monitor"
+GITHUB_BRANCH="main"
+GITHUB_ARCHIVE_URL="https://codeload.github.com/${GITHUB_REPOSITORY}/tar.gz/refs/heads/${GITHUB_BRANCH}"
+GITHUB_ARCHIVE_ROOT="${APP_NAME}-${GITHUB_BRANCH}"
 TELEGRAM_ROOT="https://api.telegram.org"
 WINDOW_SECONDS=7200
 MIN_COVERAGE_SECONDS=6480
@@ -690,7 +692,7 @@ verify_ubuntu() {
 
 ensure_dependencies() {
     local missing=0 command_name
-    for command_name in curl ip flock python3 awk getent groupadd useradd runuser systemd-run sha256sum; do
+    for command_name in curl ip flock python3 awk getent groupadd useradd runuser systemd-run sha256sum tar; do
         command -v "$command_name" >/dev/null || missing=1
     done
     if ! dpkg-query -W -f='${Status}' libpam-modules 2>/dev/null | grep -Fq 'install ok installed'; then
@@ -700,7 +702,7 @@ ensure_dependencies() {
         info "正在安装 Ubuntu 基础组件……"
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq bash curl ca-certificates iproute2 util-linux python3 gawk passwd libpam-modules
+        apt-get install -y -qq bash curl ca-certificates iproute2 util-linux python3 gawk passwd libpam-modules tar
     fi
     success "基础组件已就绪（运行时无第三方库）"
 }
@@ -726,7 +728,7 @@ version_is_newer() {
             && 10#$candidate_patch > 10#$installed_patch) ))
 }
 
-verify_release_script() {
+verify_downloaded_script() {
     local script_file="$1" checksum_file="$2" expected listed extra actual
     local -a checksum_lines=()
     mapfile -t checksum_lines < "$checksum_file" || return 1
@@ -742,15 +744,21 @@ verify_release_script() {
     bash -n "$script_file"
 }
 
-download_verified_release() {
-    local output_file="$1" checksum_file="${WORK_DIR}/TG-check-notify.sh.sha256" attempt
+extract_verified_main_archive() {
+    local archive_file="$1" output_file="$2" checksum_file="$3"
+    tar -xOzf "$archive_file" "${GITHUB_ARCHIVE_ROOT}/TG-check-notify.sh" > "$output_file" \
+        && tar -xOzf "$archive_file" "${GITHUB_ARCHIVE_ROOT}/TG-check-notify.sh.sha256" > "$checksum_file" \
+        && verify_downloaded_script "$output_file" "$checksum_file"
+}
+
+download_verified_main() {
+    local output_file="$1" checksum_file="${WORK_DIR}/TG-check-notify.sh.sha256"
+    local archive_file="${WORK_DIR}/vps-monitor-main.tar.gz" attempt
     for attempt in 1 2 3; do
-        rm -f -- "$output_file" "$checksum_file"
+        rm -f -- "$output_file" "$checksum_file" "$archive_file"
         if curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 \
-                --connect-timeout 10 --max-time 60 "$RELEASE_SCRIPT_URL" -o "$output_file" \
-            && curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 \
-                --connect-timeout 10 --max-time 30 "$RELEASE_CHECKSUM_URL" -o "$checksum_file" \
-            && verify_release_script "$output_file" "$checksum_file"; then
+                --connect-timeout 10 --max-time 60 "$GITHUB_ARCHIVE_URL" -o "$archive_file" \
+            && extract_verified_main_archive "$archive_file" "$output_file" "$checksum_file"; then
             chmod 0700 "$output_file"
             return 0
         fi
@@ -894,8 +902,8 @@ install_script_source() {
         && "$source_file" != /dev/stdin && "$source_file" != /proc/self/fd/* ]]; then
         cp -- "$source_file" "$temporary"
     else
-        info "正在下载并校验 GitHub 正式版本……"
-        download_verified_release "$temporary" || fatal "正式版本下载或 SHA-256 校验失败，安装已安全停止。"
+        info "正在下载并校验 GitHub 主版本……"
+        download_verified_main "$temporary" || fatal "主版本下载或 SHA-256 校验失败，安装已安全停止。"
     fi
     grep -q '^# VPS_TELEGRAM_MONITOR_SCRIPT=1$' "$temporary" || fatal "下载文件校验失败。"
     bash -n "$temporary" || fatal "脚本语法校验失败。"
@@ -1006,18 +1014,18 @@ run_update() {
     chmod 0700 "$WORK_DIR"
     trap cleanup_work_dir EXIT
     local downloaded="${WORK_DIR}/TG-check-notify.sh" backup_dir="${WORK_DIR}/backup"
-    local installed_version release_version unit
+    local installed_version remote_version unit
 
-    info "正在检查 GitHub 正式版本并验证 SHA-256……"
-    download_verified_release "$downloaded" || fatal "正式版本下载或 SHA-256 校验失败，现有程序未被修改。"
+    info "正在检查 GitHub 主版本并验证 SHA-256……"
+    download_verified_main "$downloaded" || fatal "主版本下载或 SHA-256 校验失败，现有程序未被修改。"
     installed_version="$(script_version "$SCRIPT_PATH")" || fatal "无法识别当前安装版本，现有程序未被修改。"
-    release_version="$(script_version "$downloaded")" || fatal "无法识别正式版本，现有程序未被修改。"
-    if [[ "$release_version" == "$installed_version" ]]; then
+    remote_version="$(script_version "$downloaded")" || fatal "无法识别主版本，现有程序未被修改。"
+    if [[ "$remote_version" == "$installed_version" ]]; then
         success "当前已经是最新版 v${installed_version}，配置和统计数据均未改动。"
         return
     fi
-    version_is_newer "$release_version" "$installed_version" \
-        || fatal "正式版本 v${release_version} 低于当前版本 v${installed_version}，已拒绝自动降级。"
+    version_is_newer "$remote_version" "$installed_version" \
+        || fatal "主版本 v${remote_version} 低于当前版本 v${installed_version}，已拒绝自动降级。"
 
     mkdir -p "${backup_dir}/units"
     [[ -f "$LOGIN_HOOK_PATH" ]] || fatal "SSH 登录提醒组件不完整，现有程序未被修改。"
@@ -1044,12 +1052,12 @@ run_update() {
         sleep 1
     done
 
-    info "正在从 v${installed_version} 安全更新到 v${release_version}……"
+    info "正在从 v${installed_version} 安全更新到 v${remote_version}……"
     if install -o root -g root -m 0755 "$downloaded" "$SCRIPT_PATH" \
         && ln -sfn "$SCRIPT_PATH" "$BIN_PATH" \
         && "$SCRIPT_PATH" __apply-update; then
         UPDATE_TIMERS_STOPPED=0
-        success "更新完成：v${installed_version} → v${release_version}。"
+        success "更新完成：v${installed_version} → v${remote_version}。"
         printf 'TG Token、UID、历史流量和 SSH 登录提醒均已保留。\n'
         return
     fi
