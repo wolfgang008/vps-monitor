@@ -85,7 +85,7 @@ assert_equal "$expected_login" "$actual_login" "SSH login alert format"
 
 (
     load_config() { :; }
-    # shellcheck disable=SC2329 # Must remain unused by the login-alert path.
+    # shellcheck disable=SC2317,SC2329 # Must remain unused by the login-alert path.
     acquire_lock() { printf 'FAIL: login alert used the statistics lock\n' >&2; return 1; }
     send_message() { printf '%s' "$1" > "${TEST_DIR}/captured-login-alert"; }
     VPS_LOGIN_USER=root VPS_LOGIN_IP=203.0.113.8 run_login_alert >/dev/null
@@ -121,22 +121,22 @@ if grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE"; then
     exit 1
 fi
 
-(
-    # shellcheck disable=SC2329 # Called by the sourced status function.
+test_status() (
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     require_root() { :; }
-    # shellcheck disable=SC2329 # Called by the sourced status function.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     load_config() { :; }
-    # shellcheck disable=SC2329 # Called by the sourced status function.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     load_state() { LAST_TS=0; LAST_REPORT=0; }
-    # shellcheck disable=SC2329 # Called by the sourced status function.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     systemctl() { return 0; }
-    # shellcheck disable=SC2329 # Called by the sourced status function.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     sshd_pam_is_enabled() { return 0; }
-    DATA_DIR="${TEST_DIR}/status"
-    STATE_FILE="${DATA_DIR}/state.tsv"
-    SAMPLES_FILE="${DATA_DIR}/samples.tsv"
-    LOGIN_HOOK_PATH="${DATA_DIR}/login-alert-hook"
-    PAM_SSHD_FILE="${DATA_DIR}/pam-sshd"
+    local DATA_DIR="${TEST_DIR}/status"
+    local STATE_FILE="${DATA_DIR}/state.tsv"
+    local SAMPLES_FILE="${DATA_DIR}/samples.tsv"
+    local LOGIN_HOOK_PATH="${DATA_DIR}/login-alert-hook"
+    local PAM_SSHD_FILE="${DATA_DIR}/pam-sshd"
     mkdir -p "$DATA_DIR"
     printf '#!/usr/bin/env sh\nexit 0\n' > "$LOGIN_HOOK_PATH"; chmod 0700 "$LOGIN_HOOK_PATH"
     pam_login_line > "$PAM_SSHD_FILE"
@@ -144,6 +144,7 @@ fi
     grep -Fqx '定时任务: 正常' <<< "$status_output"
     grep -Fqx '登录提醒: 正常' <<< "$status_output"
 )
+test_status
 
 printf '1000\t1060\t6000\t3000\t25\t100\n' > "$SAMPLES_FILE"
 read -r rx tx busy total coverage <<< "$(calculate_window 1060)"
@@ -209,7 +210,7 @@ if command -v systemd-analyze >/dev/null 2>&1; then
 fi
 
 if ! (
-    # shellcheck disable=SC2329 # Called by the sourced account ownership check.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced account ownership check.
     getent() {
         case "${1}:${2}" in
             passwd:vpsmonitor) printf 'vpsmonitor:x:999:999::%s:/usr/sbin/nologin\n' "$DATA_DIR" ;;
@@ -224,7 +225,7 @@ if ! (
 fi
 
 if (
-    # shellcheck disable=SC2329 # Called by the sourced account ownership check.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced account ownership check.
     getent() {
         case "${1}:${2}" in
             passwd:vpsmonitor) printf 'vpsmonitor:x:999:999::/srv/existing-service:/usr/sbin/nologin\n' ;;
@@ -257,25 +258,25 @@ fi
         printf 'old unit %s\n' "$unit_name" > "${SYSTEMD_DIR}/${unit_name}"
     done
 
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     require_root() { :; }
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     verify_ubuntu() { :; }
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     ensure_dependencies() { :; }
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     is_managed_service_account() { return 0; }
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     load_config() { :; }
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     download_verified_main() { command cp -- "$candidate" "$1"; }
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     flock() { return 0; }
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     systemctl() { [[ "${1:-}" != is-active ]]; }
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     ln() { :; }
-    # shellcheck disable=SC2329 # Called by the sourced updater.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     install() {
         while (( $# > 2 )); do
             case "$1" in
@@ -309,11 +310,11 @@ fi
     LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
     PAM_SSHD_FILE="${UNINSTALL_ROOT}/pam-sshd"
 
-    # shellcheck disable=SC2329 # Called by the sourced uninstaller.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced uninstaller.
     require_root() { :; }
-    # shellcheck disable=SC2329 # Called by the sourced uninstaller.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced uninstaller.
     getent() { return 2; }
-    # shellcheck disable=SC2329 # Called by the sourced uninstaller.
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced uninstaller.
     systemctl() {
         case "${1:-}" in
             disable)
