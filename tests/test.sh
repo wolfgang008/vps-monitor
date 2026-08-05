@@ -118,4 +118,83 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify "${SYSTEMD_DIR}"/*.service "${SYSTEMD_DIR}"/*.timer
 fi
 
+if ! (
+    # shellcheck disable=SC2329 # Called by the sourced account ownership check.
+    getent() {
+        case "${1}:${2}" in
+            passwd:vpsmonitor) printf 'vpsmonitor:x:999:999::%s:/usr/sbin/nologin\n' "$DATA_DIR" ;;
+            group:vpsmonitor) printf 'vpsmonitor:x:999:\n' ;;
+            *) return 2 ;;
+        esac
+    }
+    is_managed_service_account
+); then
+    printf 'FAIL: managed service account was not recognized\n' >&2
+    exit 1
+fi
+
+if (
+    # shellcheck disable=SC2329 # Called by the sourced account ownership check.
+    getent() {
+        case "${1}:${2}" in
+            passwd:vpsmonitor) printf 'vpsmonitor:x:999:999::/srv/existing-service:/usr/sbin/nologin\n' ;;
+            group:vpsmonitor) printf 'vpsmonitor:x:999:\n' ;;
+            *) return 2 ;;
+        esac
+    }
+    is_managed_service_account
+); then
+    printf 'FAIL: unrelated system account was treated as managed\n' >&2
+    exit 1
+fi
+
+(
+    UNINSTALL_ROOT="${TEST_DIR}/uninstall"
+    SYSTEMD_DIR="${UNINSTALL_ROOT}/systemd"
+    BIN_PATH="${UNINSTALL_ROOT}/bin/vps-monitor"
+    INSTALL_DIR="${UNINSTALL_ROOT}/lib/vps-monitor"
+    CONFIG_DIR="${UNINSTALL_ROOT}/etc/vps-monitor"
+    DATA_DIR="${UNINSTALL_ROOT}/var/vps-monitor"
+    LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
+    PAM_SSHD_FILE="${UNINSTALL_ROOT}/pam-sshd"
+
+    # shellcheck disable=SC2329 # Called by the sourced uninstaller.
+    require_root() { :; }
+    # shellcheck disable=SC2329 # Called by the sourced uninstaller.
+    getent() { return 2; }
+    # shellcheck disable=SC2329 # Called by the sourced uninstaller.
+    systemctl() {
+        case "${1:-}" in
+            disable)
+                rm -f -- "${SYSTEMD_DIR}/timers.target.wants"/vps-monitor-*.timer
+                return 0
+                ;;
+            is-active|is-enabled) return 1 ;;
+            list-units) return 0 ;;
+            *) return 0 ;;
+        esac
+    }
+
+    mkdir -p "$SYSTEMD_DIR/timers.target.wants" "$(dirname -- "$BIN_PATH")" \
+        "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
+    : > "$BIN_PATH"; : > "$LOGIN_HOOK_PATH"; : > "$PAM_SSHD_FILE"
+    ensure_pam_login_line
+    for unit_name in vps-monitor-{collect,report,monthly}.{service,timer}; do
+        : > "${SYSTEMD_DIR}/${unit_name}"
+    done
+    for timer_name in vps-monitor-{collect,report,monthly}.timer; do
+        : > "${SYSTEMD_DIR}/timers.target.wants/${timer_name}"
+    done
+
+    uninstall_app >/dev/null
+    for removed_path in "$BIN_PATH" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"; do
+        [[ ! -e "$removed_path" && ! -L "$removed_path" ]] \
+            || { printf 'FAIL: uninstall left %s\n' "$removed_path" >&2; exit 1; }
+    done
+    if grep -Fqx "$PAM_MARKER" "$PAM_SSHD_FILE" || grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE"; then
+        printf 'FAIL: uninstall left PAM configuration\n' >&2
+        exit 1
+    fi
+)
+
 printf 'All lightweight tests passed.\n'

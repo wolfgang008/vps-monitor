@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -662,6 +662,20 @@ require_root() {
     (( EUID == 0 )) || fatal "请复制 README 中带 sudo 的一行命令运行。"
 }
 
+is_managed_service_account() {
+    local passwd_entry group_entry account_name account_uid account_gid account_home account_shell
+    local group_name group_gid
+    passwd_entry="$(getent passwd "$SERVICE_USER")" || return 1
+    group_entry="$(getent group "$SERVICE_USER")" || return 1
+    IFS=: read -r account_name _ account_uid account_gid _ account_home account_shell <<< "$passwd_entry"
+    IFS=: read -r group_name _ group_gid _ <<< "$group_entry"
+    is_uint "$account_uid" && is_uint "$account_gid" && is_uint "$group_gid" \
+        && (( account_uid > 0 && account_uid < 1000 )) \
+        && [[ "$account_name" == "$SERVICE_USER" && "$group_name" == "$SERVICE_USER" ]] \
+        && [[ "$account_gid" == "$group_gid" && "$account_home" == "$DATA_DIR" ]] \
+        && [[ "$account_shell" == /usr/sbin/nologin || "$account_shell" == /bin/false ]]
+}
+
 verify_ubuntu() {
     [[ -r /etc/os-release ]] || fatal "无法识别操作系统。"
     # shellcheck disable=SC1091
@@ -833,7 +847,7 @@ install_app() {
     require_root; verify_ubuntu; ensure_dependencies
     [[ -r /dev/tty && -w /dev/tty ]] || fatal "需要交互式 SSH 终端，当前环境无法安全读取 Token。"
     WORK_DIR="$(mktemp -d -t vps-monitor-install.XXXXXXXX)"; chmod 0700 "$WORK_DIR"; trap cleanup_work_dir EXIT
-    local setup_token setup_chat_id setup_interface setup_server_name
+    local setup_token setup_chat_id setup_interface setup_server_name create_service_account=0
     printf '\n╭────────────────────────────────────╮\n│  VPS Telegram Monitor 一键安装    │\n╰────────────────────────────────────╯\n\n' > /dev/tty
     read -r -s -p '请输入 Bot Token（输入不会显示）：' setup_token < /dev/tty
     printf '\n' > /dev/tty
@@ -843,14 +857,26 @@ install_app() {
     setup_interface="$(detect_interface)"; setup_server_name="$(detect_server_name)"
     success "识别结果：${setup_server_name}（${setup_interface}）"
 
-    install_script_source
-    if ! getent group "$SERVICE_USER" >/dev/null; then
-        groupadd --system "$SERVICE_USER"
+    if getent passwd "$SERVICE_USER" >/dev/null; then
+        is_managed_service_account \
+            || fatal "系统中已存在同名账户，但属性不属于本程序。为避免影响原有服务，安装已停止。"
+    else
+        ! getent group "$SERVICE_USER" >/dev/null \
+            || fatal "系统中已存在同名用户组。为避免影响原有服务，安装已停止。"
+        create_service_account=1
     fi
-    if ! getent passwd "$SERVICE_USER" >/dev/null; then
-        useradd --system --gid "$SERVICE_USER" --home-dir "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
-    elif (( $(id -u "$SERVICE_USER") >= 1000 )); then
-        fatal "系统中已存在同名普通用户 ${SERVICE_USER}，为避免修改现有账户，安装已停止。"
+    install_script_source
+    if (( create_service_account == 1 )); then
+        if ! groupadd --system "$SERVICE_USER"; then
+            rm -f -- "$BIN_PATH"; rm -rf -- "$INSTALL_DIR"
+            fatal "无法创建专用系统用户组，安装已安全停止。"
+        fi
+        if ! useradd --system --gid "$SERVICE_USER" --home-dir "$DATA_DIR" \
+            --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"; then
+            groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
+            rm -f -- "$BIN_PATH"; rm -rf -- "$INSTALL_DIR"
+            fatal "无法创建专用系统账户，安装已安全停止。"
+        fi
     fi
     systemctl stop vps-monitor-{collect,report,monthly}.{timer,service} >/dev/null 2>&1 || true
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
@@ -878,20 +904,64 @@ install_app() {
 
 uninstall_app() {
     require_root
-    remove_pam_login_line
+    local managed_account=0 unit path pam_line
+    local -a leftovers=()
+    is_managed_service_account && managed_account=1
+    pam_line="$(pam_login_line)"
+
+    remove_pam_login_line || fatal "无法安全移除 SSH PAM 登录提醒，卸载已停止。"
     systemctl disable --now vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
     systemctl stop vps-monitor-{collect,report,monthly}.service >/dev/null 2>&1 || true
     systemctl stop 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
-    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,monthly}.{service,timer} "$BIN_PATH"
-    rm -rf -- "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
-    if getent passwd "$SERVICE_USER" >/dev/null; then
-        userdel "$SERVICE_USER" >/dev/null 2>&1 || true
+    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,monthly}.{service,timer} "$BIN_PATH" || true
+    rm -rf -- "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" || true
+
+    if (( managed_account == 1 )); then
+        if getent passwd "$SERVICE_USER" >/dev/null; then
+            userdel "$SERVICE_USER" >/dev/null 2>&1 || true
+        fi
+        if getent group "$SERVICE_USER" >/dev/null; then
+            groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
+        fi
+    elif getent passwd "$SERVICE_USER" >/dev/null || getent group "$SERVICE_USER" >/dev/null; then
+        warn "检测到同名系统账户，但属性与本程序专用账户不完全匹配，已保留以免影响原有服务。"
     fi
-    if getent group "$SERVICE_USER" >/dev/null; then
-        groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
+
+    if ! systemctl daemon-reload; then
+        leftovers+=("systemd 配置重新加载失败")
     fi
-    systemctl daemon-reload
-    success "程序、登录提醒、Token 和统计文件已全部删除。"
+    systemctl reset-failed vps-monitor-{collect,report,monthly}.{service,timer} >/dev/null 2>&1 || true
+    systemctl reset-failed 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
+
+    for path in "$BIN_PATH" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" \
+        "${SYSTEMD_DIR}"/vps-monitor-{collect,report,monthly}.{service,timer} \
+        "${SYSTEMD_DIR}"/timers.target.wants/vps-monitor-{collect,report,monthly}.timer; do
+        [[ ! -e "$path" && ! -L "$path" ]] || leftovers+=("$path")
+    done
+    for unit in vps-monitor-{collect,report,monthly}.{service,timer}; do
+        systemctl is-active --quiet "$unit" && leftovers+=("仍在运行的 systemd 单元 ${unit}")
+        systemctl is-enabled --quiet "$unit" && leftovers+=("仍然启用的 systemd 单元 ${unit}")
+    done
+    if systemctl list-units --state=active --type=service --plain --no-legend \
+        'vps-monitor-login-alert-*.service' 2>/dev/null | grep -q .; then
+        leftovers+=("仍在运行的 SSH 登录提醒任务")
+    fi
+    if [[ -f "$PAM_SSHD_FILE" ]] \
+        && { grep -Fqx "$pam_line" "$PAM_SSHD_FILE" || grep -Fqx "$PAM_MARKER" "$PAM_SSHD_FILE"; }; then
+        leftovers+=("SSH PAM 登录提醒配置")
+    fi
+    if (( managed_account == 1 )); then
+        getent passwd "$SERVICE_USER" >/dev/null && leftovers+=("专用用户 ${SERVICE_USER}")
+        getent group "$SERVICE_USER" >/dev/null && leftovers+=("专用用户组 ${SERVICE_USER}")
+    fi
+
+    if (( ${#leftovers[@]} > 0 )); then
+        warn "卸载未完全完成，以下项目仍然存在："
+        printf '  - %s\n' "${leftovers[@]}"
+        fatal "请保留此输出并检查系统状态；脚本没有修改任何无关资源。"
+    fi
+    success "程序、定时任务、登录提醒、Token、统计数据和专用账户均已删除。"
+    warn "为避免影响系统，Ubuntu 公共组件、systemd 历史日志和 Telegram 聊天消息不会被删除。"
 }
 
 usage() {
