@@ -7,7 +7,7 @@ curl -fsSL https://raw.githubusercontent.com/wolfgang008/vps-monitor/main/TG-che
 更新：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wolfgang008/vps-monitor/main/TG-check-notify.sh | sudo bash -s -- update
+sudo vps-monitor update
 ```
 
 卸载：
