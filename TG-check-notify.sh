@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.5.1"
+VERSION="1.5.2"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -20,8 +20,10 @@ INTERFACE_FILE="${CONFIG_DIR}/interface"
 STATE_FILE="${DATA_DIR}/state.tsv"
 SAMPLES_FILE="${DATA_DIR}/samples.tsv"
 LOCK_FILE="${DATA_DIR}/monitor.lock"
+UPDATE_LOCK_FILE="/run/lock/vps-monitor-update.lock"
 LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
 PAM_SSHD_FILE="${VPS_MONITOR_PAM_SSHD_FILE:-/etc/pam.d/sshd}"
+SSHD_BIN="${VPS_MONITOR_SSHD_BIN:-/usr/sbin/sshd}"
 PAM_MARKER="# vps-monitor SSH login alert"
 GITHUB_REPOSITORY="wolfgang008/vps-monitor"
 GITHUB_BRANCH="main"
@@ -195,7 +197,7 @@ add_month_delta() {
 
     local previous_seconds=0 boundary previous_rx=0 previous_tx=0 previous_busy=0 previous_total=0
     boundary="$(date -d "${current_month}-01 00:00:00" +%s 2>/dev/null || printf '0')"
-    if is_uint "$boundary" && (( elapsed <= MAX_SAMPLE_SECONDS && LAST_TS < boundary && boundary < CURRENT_TS )); then
+    if is_uint "$boundary" && (( LAST_TS < boundary && boundary < CURRENT_TS )); then
         previous_seconds=$((boundary - LAST_TS))
         previous_rx=$((rx_delta * previous_seconds / elapsed))
         previous_tx=$((tx_delta * previous_seconds / elapsed))
@@ -411,7 +413,7 @@ run_test_message() {
 }
 
 run_login_alert() {
-    load_config; acquire_lock
+    load_config
     local login_user="${VPS_LOGIN_USER:-}" login_ip="${VPS_LOGIN_IP:-}" login_epoch message
     [[ "$login_user" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || return 0
     [[ "$login_ip" =~ ^[A-Fa-f0-9:.]{3,64}$ ]] || return 0
@@ -423,15 +425,23 @@ run_login_alert() {
 }
 
 run_status() {
+    require_root
     load_config; load_state
-    local last_sample="暂无" last_report="暂无" sample_count=0 state_size=0 login_alert="未启用"
+    local last_sample="暂无" last_report="暂无" sample_count=0 state_size=0
+    local login_alert="异常" timers="正常" timer
     (( LAST_TS > 0 )) && last_sample="$(date -d "@${LAST_TS}" '+%F %T %Z')"
     (( LAST_REPORT > 0 )) && last_report="$(date -d "@${LAST_REPORT}" '+%F %T %Z')"
     [[ -r "$SAMPLES_FILE" ]] && sample_count="$(wc -l < "$SAMPLES_FILE")"
     [[ -r "$STATE_FILE" ]] && state_size="$(wc -c < "$STATE_FILE")"
-    [[ -r "$PAM_SSHD_FILE" ]] && grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE" && login_alert="已启用"
-    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n登录提醒: %s\n最近采样: %s\n最近汇报: %s\n短期样本: %s 条\n状态文件: %s 字节\n' \
-        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$login_alert" "$last_sample" "$last_report" "$sample_count" "$state_size"
+    for timer in vps-monitor-{collect,report,monthly}.timer; do
+        systemctl is-enabled --quiet "$timer" && systemctl is-active --quiet "$timer" || timers="异常"
+    done
+    if [[ -x "$LOGIN_HOOK_PATH" && -r "$PAM_SSHD_FILE" ]] \
+        && grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE" && sshd_pam_is_enabled; then
+        login_alert="正常"
+    fi
+    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n定时任务: %s\n登录提醒: %s\n最近采样: %s\n最近汇报: %s\n短期样本: %s 条\n状态文件: %s 字节\n' \
+        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$timers" "$login_alert" "$last_sample" "$last_report" "$sample_count" "$state_size"
 }
 
 setup_api_call() {
@@ -547,6 +557,11 @@ pam_login_line() {
     printf 'session optional pam_exec.so quiet type=open_session %s' "$LOGIN_HOOK_PATH"
 }
 
+sshd_pam_is_enabled() {
+    [[ -x "$SSHD_BIN" ]] || return 1
+    "$SSHD_BIN" -T 2>/dev/null | awk '$1 == "usepam" && value == "" { value=$2 } END { print value }' | grep -Fqx yes
+}
+
 render_login_hook() {
     cat <<'EOF'
 #!/bin/sh
@@ -568,7 +583,7 @@ case "$PAM_RHOST" in
 esac
 
 /usr/bin/systemd-run --quiet --no-block --collect \
-    --unit="vps-monitor-login-alert-$(date +%s%N)-$$" \
+    --unit="vps-monitor-login-alert-$(/usr/bin/date +%s%N)-$$" \
     --description="VPS SSH login alert" \
     --property=User=vpsmonitor \
     --property=Group=vpsmonitor \
@@ -618,6 +633,8 @@ remove_pam_login_line() {
 }
 
 install_login_alert_hook() {
+    sshd_pam_is_enabled \
+        || fatal "SSH 未启用 PAM 会话处理（UsePAM yes），无法保证登录提醒生效，安装已停止。"
     [[ -f "$PAM_SSHD_FILE" && -w "$PAM_SSHD_FILE" ]] || fatal "找不到可写的 SSH PAM 配置，无法启用登录提醒。"
     render_login_hook > "${WORK_DIR}/login-alert-hook"
     sh -n "${WORK_DIR}/login-alert-hook" || fatal "登录提醒钩子语法校验失败。"
@@ -665,6 +682,17 @@ PY
 
 require_root() {
     (( EUID == 0 )) || fatal "请复制 README 中带 sudo 的一行命令运行。"
+}
+
+run_as_service_user_if_needed() {
+    local command_name="$1"
+    (( EUID == 0 )) || {
+        [[ "$(id -un)" == "$SERVICE_USER" ]] \
+            || fatal "运行任务只能由专用账户执行；请使用 sudo vps-monitor ${command_name}。"
+        return
+    }
+    is_managed_service_account || fatal "专用系统账户状态异常，无法安全运行监控任务。"
+    exec runuser -u "$SERVICE_USER" -- "$SCRIPT_PATH" "$@"
 }
 
 is_managed_service_account() {
@@ -968,10 +996,10 @@ install_app() {
     chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
 
     install_systemd_units
+    install_login_alert_hook
     systemctl daemon-reload
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
     systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null
-    install_login_alert_hook
     success "安装完成，Telegram 安全启动链接与 SSH 登录提醒已验证"
     printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每月 1 日发送月报；SSH 登录成功时立即提醒。\n'
     printf '查看状态：sudo vps-monitor status\n查看日志：sudo journalctl -u "vps-monitor-*" --since today\n\n'
@@ -1005,6 +1033,8 @@ restore_update_backup() {
 
 run_update() {
     require_root; verify_ubuntu; ensure_dependencies
+    exec 8>"$UPDATE_LOCK_FILE"
+    flock -n 8 || fatal "另一个更新任务正在运行，请稍后再试。"
     [[ -f "$SCRIPT_PATH" && -x "$SCRIPT_PATH" && -e "$BIN_PATH" ]] \
         || fatal "未检测到完整安装，请先运行 README 中的一键安装命令。"
     is_managed_service_account || fatal "专用系统账户状态异常，为避免影响其他程序，更新已停止。"
@@ -1137,6 +1167,9 @@ usage() {
 }
 
 main() {
+    case "${1:-install}" in
+        collect|report|monthly|test|login-alert) run_as_service_user_if_needed "$@" ;;
+    esac
     case "${1:-install}" in
         install) install_app ;;
         collect) run_collect ;;

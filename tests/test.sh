@@ -28,6 +28,11 @@ if is_telegram_uid "@example" || is_telegram_uid "012345" || is_telegram_uid "-1
     exit 1
 fi
 
+if (run_as_service_user_if_needed collect) >/dev/null 2>&1; then
+    printf 'FAIL: non-service user was allowed to run a state-writing command\n' >&2
+    exit 1
+fi
+
 printf '%s' 'vps_0123456789abcdef0123456789abcdef' > "${TEST_DIR}/bind-nonce"
 printf '%s\n' '{"ok":true,"result":[{"update_id":7,"message":{"text":"/start wrong","from":{"id":111,"is_bot":false},"chat":{"id":111,"type":"private"}}},{"update_id":9,"message":{"text":"/start vps_0123456789abcdef0123456789abcdef","from":{"id":987654321,"is_bot":false},"chat":{"id":987654321,"type":"private"}}}]}' > "${TEST_DIR}/telegram-updates.json"
 assert_equal "10" "$(telegram_updates_cursor "${TEST_DIR}/telegram-updates.json")" "Telegram update cursor"
@@ -80,7 +85,8 @@ assert_equal "$expected_login" "$actual_login" "SSH login alert format"
 
 (
     load_config() { :; }
-    acquire_lock() { :; }
+    # shellcheck disable=SC2329 # Must remain unused by the login-alert path.
+    acquire_lock() { printf 'FAIL: login alert used the statistics lock\n' >&2; return 1; }
     send_message() { printf '%s' "$1" > "${TEST_DIR}/captured-login-alert"; }
     VPS_LOGIN_USER=root VPS_LOGIN_IP=203.0.113.8 run_login_alert >/dev/null
 )
@@ -91,7 +97,18 @@ login_prefix=$'⚠️ VPS 登录提醒\n服务器: 测试服务器\n登录用户
 render_login_hook > "${TEST_DIR}/login-alert-hook"
 sh -n "${TEST_DIR}/login-alert-hook"
 grep -Fq -- '--no-block' "${TEST_DIR}/login-alert-hook"
+grep -Fq -- '/usr/bin/date +%s%N' "${TEST_DIR}/login-alert-hook"
 grep -Fq -- "VPS_LOGIN_IP=\$PAM_RHOST" "${TEST_DIR}/login-alert-hook"
+
+SSHD_BIN="${TEST_DIR}/sshd"
+printf '#!/usr/bin/env sh\nprintf "usepam yes\\n"\n' > "$SSHD_BIN"
+chmod 0700 "$SSHD_BIN"
+sshd_pam_is_enabled || { printf 'FAIL: enabled SSH PAM was rejected\n' >&2; exit 1; }
+printf '#!/usr/bin/env sh\nprintf "usepam no\\n"\n' > "$SSHD_BIN"
+if sshd_pam_is_enabled; then
+    printf 'FAIL: disabled SSH PAM was accepted\n' >&2
+    exit 1
+fi
 
 PAM_SSHD_FILE="${TEST_DIR}/pam-sshd"
 printf 'session required pam_unix.so\n' > "$PAM_SSHD_FILE"
@@ -103,6 +120,30 @@ if grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE"; then
     printf 'FAIL: PAM hook was not removed\n' >&2
     exit 1
 fi
+
+(
+    # shellcheck disable=SC2329 # Called by the sourced status function.
+    require_root() { :; }
+    # shellcheck disable=SC2329 # Called by the sourced status function.
+    load_config() { :; }
+    # shellcheck disable=SC2329 # Called by the sourced status function.
+    load_state() { LAST_TS=0; LAST_REPORT=0; }
+    # shellcheck disable=SC2329 # Called by the sourced status function.
+    systemctl() { return 0; }
+    # shellcheck disable=SC2329 # Called by the sourced status function.
+    sshd_pam_is_enabled() { return 0; }
+    DATA_DIR="${TEST_DIR}/status"
+    STATE_FILE="${DATA_DIR}/state.tsv"
+    SAMPLES_FILE="${DATA_DIR}/samples.tsv"
+    LOGIN_HOOK_PATH="${DATA_DIR}/login-alert-hook"
+    PAM_SSHD_FILE="${DATA_DIR}/pam-sshd"
+    mkdir -p "$DATA_DIR"
+    printf '#!/usr/bin/env sh\nexit 0\n' > "$LOGIN_HOOK_PATH"; chmod 0700 "$LOGIN_HOOK_PATH"
+    pam_login_line > "$PAM_SSHD_FILE"
+    status_output="$(run_status)"
+    grep -Fqx '定时任务: 正常' <<< "$status_output"
+    grep -Fqx '登录提醒: 正常' <<< "$status_output"
+)
 
 printf '1000\t1060\t6000\t3000\t25\t100\n' > "$SAMPLES_FILE"
 read -r rx tx busy total coverage <<< "$(calculate_window 1060)"
@@ -137,6 +178,23 @@ assert_equal "4000" "$MONTH_TX" "new month tx split"
 assert_equal "150" "$MONTH_CPU_BUSY" "new month cpu split"
 assert_equal "300" "$MONTH_CPU_TOTAL" "new month cpu total split"
 assert_equal "300" "$MONTH_SECONDS" "new month duration split"
+
+STATE_MONTH="2026-07"
+MONTH_RX=100; MONTH_TX=200; MONTH_CPU_BUSY=10; MONTH_CPU_TOTAL=50; MONTH_SECONDS=60
+LAST_TS="$(date -d '2026-07-31 23:00:00 UTC' +%s)"
+CURRENT_TS="$(date -d '2026-08-01 01:00:00 UTC' +%s)"
+add_month_delta 2026-08 7200 7200 14400 3600 7200
+read -r archived_rx archived_tx archived_busy archived_total archived_seconds < "${DATA_DIR}/month-2026-07.tsv"
+assert_equal "3700" "$archived_rx" "long-gap previous month rx split"
+assert_equal "7400" "$archived_tx" "long-gap previous month tx split"
+assert_equal "1810" "$archived_busy" "long-gap previous month cpu split"
+assert_equal "3650" "$archived_total" "long-gap previous month cpu total split"
+assert_equal "3660" "$archived_seconds" "long-gap previous month duration split"
+assert_equal "3600" "$MONTH_RX" "long-gap new month rx split"
+assert_equal "7200" "$MONTH_TX" "long-gap new month tx split"
+assert_equal "1800" "$MONTH_CPU_BUSY" "long-gap new month cpu split"
+assert_equal "3600" "$MONTH_CPU_TOTAL" "long-gap new month cpu total split"
+assert_equal "3600" "$MONTH_SECONDS" "long-gap new month duration split"
 
 SYSTEMD_DIR="${TEST_DIR}/systemd"
 BIN_PATH="/bin/true"
@@ -179,6 +237,67 @@ if (
     printf 'FAIL: unrelated system account was treated as managed\n' >&2
     exit 1
 fi
+
+(
+    UPDATE_ROOT="${TEST_DIR}/update-rollback"
+    SCRIPT_PATH="${UPDATE_ROOT}/installed.sh"
+    BIN_PATH="${UPDATE_ROOT}/bin/vps-monitor"
+    INSTALL_DIR="${UPDATE_ROOT}/lib"
+    LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
+    SYSTEMD_DIR="${UPDATE_ROOT}/systemd"
+    UPDATE_LOCK_FILE="${UPDATE_ROOT}/update.lock"
+    candidate="${UPDATE_ROOT}/candidate.sh"
+    mkdir -p "$(dirname -- "$BIN_PATH")" "$INSTALL_DIR" "$SYSTEMD_DIR"
+    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.5.1"\nexit 0\n' > "$SCRIPT_PATH"
+    printf '#!/usr/bin/env sh\nexit 0\n' > "$LOGIN_HOOK_PATH"
+    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.5.2"\nexit 1\n' > "$candidate"
+    chmod 0700 "$SCRIPT_PATH" "$LOGIN_HOOK_PATH" "$candidate"
+    : > "$BIN_PATH"
+    for unit_name in vps-monitor-{collect,report,monthly}.{service,timer}; do
+        printf 'old unit %s\n' "$unit_name" > "${SYSTEMD_DIR}/${unit_name}"
+    done
+
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    require_root() { :; }
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    verify_ubuntu() { :; }
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    ensure_dependencies() { :; }
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    is_managed_service_account() { return 0; }
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    load_config() { :; }
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    download_verified_main() { command cp -- "$candidate" "$1"; }
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    flock() { return 0; }
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    systemctl() { [[ "${1:-}" != is-active ]]; }
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    ln() { :; }
+    # shellcheck disable=SC2329 # Called by the sourced updater.
+    install() {
+        while (( $# > 2 )); do
+            case "$1" in
+                -o|-g|-m) shift 2 ;;
+                --) shift; break ;;
+                *) break ;;
+            esac
+        done
+        command cp -- "$1" "$2"
+        command chmod 0700 "$2"
+    }
+
+    if (run_update) >/dev/null 2>&1; then
+        printf 'FAIL: failed update was reported as successful\n' >&2
+        exit 1
+    fi
+    assert_equal "1.5.1" "$(script_version "$SCRIPT_PATH")" "failed update script rollback"
+    for unit_name in vps-monitor-{collect,report,monthly}.{service,timer}; do
+        grep -Fqx "old unit ${unit_name}" "${SYSTEMD_DIR}/${unit_name}" \
+            || { printf 'FAIL: failed update did not restore %s\n' "$unit_name" >&2; exit 1; }
+    done
+)
 
 (
     UNINSTALL_ROOT="${TEST_DIR}/uninstall"
