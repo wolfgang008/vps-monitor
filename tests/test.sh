@@ -121,7 +121,7 @@ if grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE"; then
     exit 1
 fi
 
-test_status() (
+test_status() {
     # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     require_root() { :; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
@@ -143,8 +143,8 @@ test_status() (
     status_output="$(run_status)"
     grep -Fqx '定时任务: 正常' <<< "$status_output"
     grep -Fqx '登录提醒: 正常' <<< "$status_output"
-)
-test_status
+}
+(test_status)
 
 printf '1000\t1060\t6000\t3000\t25\t100\n' > "$SAMPLES_FILE"
 read -r rx tx busy total coverage <<< "$(calculate_window 1060)"
