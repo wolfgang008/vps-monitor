@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -445,21 +445,97 @@ setup_api_call() {
         && grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$response"
 }
 
-prepare_telegram_target() {
-    local token="$1" uid="$2" response="${WORK_DIR}/telegram-response.json"
-    local bot_username
+telegram_updates_cursor() {
+    python3 - "$1" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        updates = json.load(handle).get("result", [])
+    cursor = max((int(item.get("update_id", -1)) + 1 for item in updates), default=0)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+print(cursor)
+PY
+}
+
+telegram_start_match() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        updates = json.load(handle).get("result", [])
+    with open(sys.argv[2], encoding="utf-8") as handle:
+        nonce = handle.read().strip()
+    cursor = int(sys.argv[3])
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+uid = ""
+expected = f"/start {nonce}"
+for update in updates:
+    try:
+        cursor = max(cursor, int(update.get("update_id", -1)) + 1)
+    except (ValueError, TypeError):
+        continue
+    message = update.get("message") or {}
+    sender = message.get("from") or {}
+    chat = message.get("chat") or {}
+    sender_id = sender.get("id")
+    chat_id = chat.get("id")
+    if (message.get("text") == expected and chat.get("type") == "private"
+            and sender.get("is_bot") is not True and isinstance(sender_id, int)
+            and sender_id > 0 and sender_id == chat_id):
+        uid = str(sender_id)
+print(f"{cursor}\t{uid}")
+PY
+}
+
+resolve_telegram_uid() {
+    local token="$1" response="${WORK_DIR}/telegram-response.json" nonce_file="${WORK_DIR}/bind-nonce"
+    local bot_username webhook nonce start_time cursor parsed uid=""
     info "正在安全验证 Bot Token……" > /dev/tty
     setup_api_call "$token" getMe "$response" || fatal "Token 无效，或 VPS 无法访问 Telegram API。"
     bot_username="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["result"]["username"])' "$response" 2>/dev/null || true)"
     [[ "$bot_username" =~ ^[A-Za-z0-9_]{5,32}$ ]] || fatal "无法读取机器人用户名。"
     success "Token 有效，机器人为 @${bot_username}" > /dev/tty
-    printf '\n请先打开下面的机器人并点击“开始/START”：\n\n  https://t.me/%s\n\n' "$bot_username" > /dev/tty
-    read -r -p '完成后按回车继续验证 UID：' < /dev/tty
-    info "正在发送安装验证消息……" > /dev/tty
-    setup_api_call "$token" sendMessage "$response" \
-        "chat_id=${uid}" "text=VPS Monitor：Telegram UID 验证成功。" \
-        || fatal "无法向此 UID 发送消息。请确认 UID 正确，并已向 @${bot_username} 发送 /start。"
-    success "Telegram UID 验证通过" > /dev/tty
+
+    setup_api_call "$token" getWebhookInfo "$response" || fatal "无法检查机器人状态。"
+    webhook="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["result"].get("url", ""))' "$response" 2>/dev/null || true)"
+    [[ -z "$webhook" ]] || fatal "该机器人已配置 Webhook，无法使用安全启动链接。请创建一个专用机器人。"
+
+    setup_api_call "$token" getUpdates "$response" "timeout=0" "limit=1" "offset=-1" \
+        || fatal "无法初始化机器人消息，请确认该机器人没有被其他程序同时使用。"
+    cursor="$(telegram_updates_cursor "$response")" || fatal "无法解析 Telegram 返回的数据。"
+    is_uint "$cursor" || fatal "Telegram 更新游标格式异常。"
+
+    nonce="vps_$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+    [[ "$nonce" =~ ^vps_[A-Fa-f0-9]{32}$ ]] || fatal "无法生成安全的一次性验证码。"
+    printf '%s' "$nonce" > "$nonce_file"; chmod 0600 "$nonce_file"
+    printf '\n请打开下面的一次性安全链接，并点击“开始/START”：\n\n  https://t.me/%s?start=%s\n\n' \
+        "$bot_username" "$nonce" > /dev/tty
+    printf '正在等待 Telegram 确认（最长 3 分钟）' > /dev/tty
+
+    start_time=$SECONDS
+    while (( SECONDS - start_time < 180 )); do
+        if setup_api_call "$token" getUpdates "$response" "timeout=10" "limit=100" "offset=${cursor}"; then
+            parsed="$(telegram_start_match "$response" "$nonce_file" "$cursor")" || parsed=""
+            IFS=$'\t' read -r cursor uid <<< "$parsed"
+            is_uint "$cursor" || fatal "Telegram 更新游标格式异常。"
+            if is_telegram_uid "$uid"; then
+                printf ' 已确认！\n' > /dev/tty
+                setup_api_call "$token" sendMessage "$response" \
+                    "chat_id=${uid}" "text=VPS Monitor：安全启动链接验证成功。" \
+                    || fatal "已识别 UID，但测试消息发送失败，请重新运行安装命令。"
+                printf '%s' "$uid"
+                return
+            fi
+        elif grep -Eq '"error_code"[[:space:]]*:[[:space:]]*409' "$response"; then
+            fatal "该机器人正被其他程序读取消息，请使用一个专用机器人。"
+        fi
+        printf '.' > /dev/tty
+    done
+    printf '\n' > /dev/tty
+    fatal "等待超时。请重新运行安装命令，并在 3 分钟内点击安全启动链接。"
 }
 
 pam_login_line() {
@@ -757,14 +833,12 @@ install_app() {
     require_root; verify_ubuntu; ensure_dependencies
     [[ -r /dev/tty && -w /dev/tty ]] || fatal "需要交互式 SSH 终端，当前环境无法安全读取 Token。"
     WORK_DIR="$(mktemp -d -t vps-monitor-install.XXXXXXXX)"; chmod 0700 "$WORK_DIR"; trap cleanup_work_dir EXIT
-    local setup_token setup_uid setup_interface setup_server_name
+    local setup_token setup_chat_id setup_interface setup_server_name
     printf '\n╭────────────────────────────────────╮\n│  VPS Telegram Monitor 一键安装    │\n╰────────────────────────────────────╯\n\n' > /dev/tty
     read -r -s -p '请输入 Bot Token（输入不会显示）：' setup_token < /dev/tty
     printf '\n' > /dev/tty
     [[ "$setup_token" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]] || fatal "Token 格式不正确。"
-    read -r -p '请输入 Telegram 数字 UID（不是 @用户名）：' setup_uid < /dev/tty
-    is_telegram_uid "$setup_uid" || fatal "Telegram UID 必须是纯数字，且不能以 0 开头。"
-    prepare_telegram_target "$setup_token" "$setup_uid"
+    setup_chat_id="$(resolve_telegram_uid "$setup_token")"
     info "正在自动识别公网网卡、国家和服务商……"
     setup_interface="$(detect_interface)"; setup_server_name="$(detect_server_name)"
     success "识别结果：${setup_server_name}（${setup_interface}）"
@@ -782,7 +856,7 @@ install_app() {
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
     printf '%s' "$setup_token" > "${WORK_DIR}/token"
-    printf '%s' "$setup_uid" > "${WORK_DIR}/chat_id"
+    printf '%s' "$setup_chat_id" > "${WORK_DIR}/chat_id"
     printf '%s' "$setup_server_name" > "${WORK_DIR}/server_name"
     printf '%s' "$setup_interface" > "${WORK_DIR}/interface"
     install -o root -g "$SERVICE_USER" -m 0640 "${WORK_DIR}/token" "$TOKEN_FILE"
@@ -796,7 +870,7 @@ install_app() {
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
     systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null
     install_login_alert_hook
-    success "安装完成，Telegram UID 与 SSH 登录提醒已验证"
+    success "安装完成，Telegram 安全启动链接与 SSH 登录提醒已验证"
     printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每月 1 日发送月报；SSH 登录成功时立即提醒。\n'
     printf '查看状态：sudo vps-monitor status\n查看日志：sudo journalctl -u "vps-monitor-*" --since today\n\n'
     warn "Token 与 UID 仅保存在受限配置文件中，日志不会输出这些信息。"

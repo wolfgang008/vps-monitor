@@ -28,6 +28,13 @@ if is_telegram_uid "@example" || is_telegram_uid "012345" || is_telegram_uid "-1
     exit 1
 fi
 
+printf '%s' 'vps_0123456789abcdef0123456789abcdef' > "${TEST_DIR}/bind-nonce"
+printf '%s\n' '{"ok":true,"result":[{"update_id":7,"message":{"text":"/start wrong","from":{"id":111,"is_bot":false},"chat":{"id":111,"type":"private"}}},{"update_id":9,"message":{"text":"/start vps_0123456789abcdef0123456789abcdef","from":{"id":987654321,"is_bot":false},"chat":{"id":987654321,"type":"private"}}}]}' > "${TEST_DIR}/telegram-updates.json"
+assert_equal "10" "$(telegram_updates_cursor "${TEST_DIR}/telegram-updates.json")" "Telegram update cursor"
+IFS=$'\t' read -r update_cursor matched_uid <<< "$(telegram_start_match "${TEST_DIR}/telegram-updates.json" "${TEST_DIR}/bind-nonce" 0)"
+assert_equal "10" "$update_cursor" "Telegram start cursor"
+assert_equal "987654321" "$matched_uid" "Telegram secure start UID"
+
 expected_two_hour=$'测试服务器\n进站速度: 10.15 MB/s\n出站速度: 10.07 MB/s\n总流量: 2.51 TB\nCPU利用率: 29%'
 actual_two_hour="$(format_two_hour_message 76629934080 76025954304 29 100 2759774185718)"
 assert_equal "$expected_two_hour" "$actual_two_hour" "two-hour message format"
