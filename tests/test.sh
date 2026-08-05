@@ -101,26 +101,6 @@ assert_equal "25.000000" "$busy" "window busy"
 assert_equal "100.000000" "$total" "window total"
 assert_equal "60.000000" "$coverage" "window coverage"
 
-(
-    DATA_DIR="${TEST_DIR}/silent-collector"
-    STATE_FILE="${DATA_DIR}/state.tsv"
-    SAMPLES_FILE="${DATA_DIR}/samples.tsv"
-    mkdir -p "$DATA_DIR"
-    INTERFACE=eth0
-    read_counters() {
-        CURRENT_BOOT=01234567-89ab-cdef-0123-456789abcdef
-        if [[ -f "$STATE_FILE" ]]; then
-            CURRENT_TS=1060; CURRENT_RX=7000; CURRENT_TX=4000
-            CURRENT_CPU_BUSY=50; CURRENT_CPU_TOTAL=200
-        else
-            CURRENT_TS=1000; CURRENT_RX=1000; CURRENT_TX=1000
-            CURRENT_CPU_BUSY=25; CURRENT_CPU_TOTAL=100
-        fi
-    }
-    assert_equal "" "$(collect_locked)" "baseline collector output"
-    assert_equal "" "$(collect_locked)" "routine collector output"
-)
-
 pwned="${TEST_DIR}/pwned"
 # shellcheck disable=SC2016 # Literal payload verifies that state is never executed.
 printf 'month_rx\t$(touch %s)\nmonth_tx\t42\n' "$pwned" > "$STATE_FILE"
@@ -236,6 +216,26 @@ fi
         printf 'FAIL: uninstall left PAM configuration\n' >&2
         exit 1
     fi
+)
+
+(
+    DATA_DIR="${TEST_DIR}/silent-collector"
+    STATE_FILE="${DATA_DIR}/state.tsv"
+    SAMPLES_FILE="${DATA_DIR}/samples.tsv"
+    mkdir -p "$DATA_DIR"
+    INTERFACE=eth0
+    read_counters() {
+        CURRENT_BOOT=01234567-89ab-cdef-0123-456789abcdef
+        if [[ -f "$STATE_FILE" ]]; then
+            CURRENT_TS=1060; CURRENT_RX=7000; CURRENT_TX=4000
+            CURRENT_CPU_BUSY=50; CURRENT_CPU_TOTAL=200
+        else
+            CURRENT_TS=1000; CURRENT_RX=1000; CURRENT_TX=1000
+            CURRENT_CPU_BUSY=25; CURRENT_CPU_TOTAL=100
+        fi
+    }
+    assert_equal "" "$(collect_locked)" "baseline collector output"
+    assert_equal "" "$(collect_locked)" "routine collector output"
 )
 
 printf 'All lightweight tests passed.\n'
