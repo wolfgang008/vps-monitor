@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -23,10 +23,11 @@ LOCK_FILE="${DATA_DIR}/monitor.lock"
 LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
 PAM_SSHD_FILE="${VPS_MONITOR_PAM_SSHD_FILE:-/etc/pam.d/sshd}"
 PAM_MARKER="# vps-monitor SSH login alert"
-REMOTE_URL="https://raw.githubusercontent.com/wolfgang008/vps-monitor/main/TG-check-notify.sh"
+RELEASE_SCRIPT_URL="https://github.com/wolfgang008/vps-monitor/releases/latest/download/TG-check-notify.sh"
+RELEASE_CHECKSUM_URL="https://github.com/wolfgang008/vps-monitor/releases/latest/download/TG-check-notify.sh.sha256"
 TELEGRAM_ROOT="https://api.telegram.org"
 WINDOW_SECONDS=7200
-MIN_COVERAGE_SECONDS=1800
+MIN_COVERAGE_SECONDS=6480
 MAX_SAMPLE_SECONDS=900
 SAMPLE_RETENTION_SECONDS=21600
 
@@ -49,6 +50,7 @@ MONTH_CPU_TOTAL=0
 MONTH_SECONDS=0
 LAST_REPORT=0
 WORK_DIR=""
+UPDATE_TIMERS_STOPPED=0
 
 if [[ -t 1 ]]; then
     C_GREEN=$'\033[32m'; C_BLUE=$'\033[36m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_RESET=$'\033[0m'
@@ -64,6 +66,9 @@ is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 is_telegram_uid() { [[ "${1:-}" =~ ^[1-9][0-9]{0,19}$ ]]; }
 
 cleanup_work_dir() {
+    if (( UPDATE_TIMERS_STOPPED == 1 )) && (( EUID == 0 )) && command -v systemctl >/dev/null; then
+        systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
+    fi
     if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
         rm -rf -- "$WORK_DIR"
     fi
@@ -228,7 +233,6 @@ collect_locked() {
         LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"
         LAST_CPU_BUSY="$CURRENT_CPU_BUSY"; LAST_CPU_TOTAL="$CURRENT_CPU_TOTAL"
         save_state
-        printf 'baseline\n'
         return
     fi
 
@@ -241,7 +245,7 @@ collect_locked() {
         LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"
         LAST_CPU_BUSY="$CURRENT_CPU_BUSY"; LAST_CPU_TOTAL="$CURRENT_CPU_TOTAL"
         save_state
-        printf 'counter-reset\n'
+        warn "检测到系统计数器重置，已自动建立新的安全基线。" >&2
         return
     fi
 
@@ -260,7 +264,6 @@ collect_locked() {
             "$sample_start" "$CURRENT_TS" "$rx_delta" "$tx_delta" "$busy_delta" "$total_delta" >> "$SAMPLES_FILE"
     fi
     prune_samples
-    printf 'sampled\n'
 }
 
 acquire_lock() {
@@ -297,7 +300,7 @@ format_two_hour_message() {
         BEGIN {
             cpu=(total>0 ? busy*100/total : 0)
             printf "%s\n进站速度: %.2f MB/s\n出站速度: %.2f MB/s\n总流量: %.2f TB\nCPU利用率: %.0f%%", \
-                name, rx/7200/1048576, tx/7200/1048576, month_total/1099511627776, cpu
+                name, rx/7200/1000000, tx/7200/1000000, month_total/1000000000000, cpu
         }
     '
 }
@@ -308,7 +311,7 @@ format_month_message() {
         BEGIN {
             split(month, part, "-"); cpu=(total>0 ? busy*100/total : 0)
             printf "%s %d年%d月流量报告\n进站流量: %.2f TB\n出站流量: %.2f TB\n总流量: %.2f TB\n平均CPU利用率: %.0f%%", \
-                name, part[1], part[2], rx/1099511627776, tx/1099511627776, (rx+tx)/1099511627776, cpu
+                name, part[1], part[2], rx/1000000000000, tx/1000000000000, (rx+tx)/1000000000000, cpu
         }
     '
 }
@@ -687,7 +690,7 @@ verify_ubuntu() {
 
 ensure_dependencies() {
     local missing=0 command_name
-    for command_name in curl ip flock python3 awk getent groupadd useradd runuser systemd-run; do
+    for command_name in curl ip flock python3 awk getent groupadd useradd runuser systemd-run sha256sum; do
         command -v "$command_name" >/dev/null || missing=1
     done
     if ! dpkg-query -W -f='${Status}' libpam-modules 2>/dev/null | grep -Fq 'install ok installed'; then
@@ -700,6 +703,60 @@ ensure_dependencies() {
         apt-get install -y -qq bash curl ca-certificates iproute2 util-linux python3 gawk passwd libpam-modules
     fi
     success "基础组件已就绪（运行时无第三方库）"
+}
+
+script_version() {
+    local file="$1" version
+    version="$(sed -nE 's/^VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$file" | head -n 1)"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    printf '%s' "$version"
+}
+
+version_is_newer() {
+    local candidate="$1" installed="$2"
+    local candidate_major candidate_minor candidate_patch installed_major installed_minor installed_patch
+    IFS=. read -r candidate_major candidate_minor candidate_patch <<< "$candidate"
+    IFS=. read -r installed_major installed_minor installed_patch <<< "$installed"
+    is_uint "$candidate_major" && is_uint "$candidate_minor" && is_uint "$candidate_patch" \
+        && is_uint "$installed_major" && is_uint "$installed_minor" && is_uint "$installed_patch" \
+        || return 1
+    (( 10#$candidate_major > 10#$installed_major \
+        || (10#$candidate_major == 10#$installed_major && 10#$candidate_minor > 10#$installed_minor) \
+        || (10#$candidate_major == 10#$installed_major && 10#$candidate_minor == 10#$installed_minor \
+            && 10#$candidate_patch > 10#$installed_patch) ))
+}
+
+verify_release_script() {
+    local script_file="$1" checksum_file="$2" expected listed extra actual
+    local -a checksum_lines=()
+    mapfile -t checksum_lines < "$checksum_file" || return 1
+    (( ${#checksum_lines[@]} == 1 )) || return 1
+    read -r expected listed extra <<< "${checksum_lines[0]}"
+    listed="${listed#\*}"
+    [[ -z "${extra:-}" && "$expected" =~ ^[A-Fa-f0-9]{64}$ && "$listed" == "TG-check-notify.sh" ]] \
+        || return 1
+    actual="$(sha256sum "$script_file" | awk '{print $1}')" || return 1
+    [[ "${expected,,}" == "${actual,,}" ]] || return 1
+    grep -q '^# VPS_TELEGRAM_MONITOR_SCRIPT=1$' "$script_file" || return 1
+    script_version "$script_file" >/dev/null || return 1
+    bash -n "$script_file"
+}
+
+download_verified_release() {
+    local output_file="$1" checksum_file="${WORK_DIR}/TG-check-notify.sh.sha256" attempt
+    for attempt in 1 2 3; do
+        rm -f -- "$output_file" "$checksum_file"
+        if curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 \
+                --connect-timeout 10 --max-time 60 "$RELEASE_SCRIPT_URL" -o "$output_file" \
+            && curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 \
+                --connect-timeout 10 --max-time 30 "$RELEASE_CHECKSUM_URL" -o "$checksum_file" \
+            && verify_release_script "$output_file" "$checksum_file"; then
+            chmod 0700 "$output_file"
+            return 0
+        fi
+        (( attempt < 3 )) && sleep "$attempt"
+    done
+    return 1
 }
 
 install_systemd_units() {
@@ -730,12 +787,14 @@ RestrictNamespaces=yes
 RestrictAddressFamilies=AF_UNIX
 ReadWritePaths=${DATA_DIR}
 TimeoutStartSec=60
+StandardOutput=null
+StandardError=journal
 EOF
     cat > "${SYSTEMD_DIR}/vps-monitor-collect.timer" <<EOF
 [Unit]
 Description=Collect VPS counters every five minutes
 [Timer]
-OnBootSec=1min
+OnBootSec=10s
 OnUnitActiveSec=5min
 AccuracySec=10s
 Unit=vps-monitor-collect.service
@@ -831,10 +890,12 @@ EOF
 
 install_script_source() {
     local source_file="${BASH_SOURCE[0]:-}" temporary="${WORK_DIR}/TG-check-notify.sh"
-    if [[ -n "$source_file" && -f "$source_file" && "$source_file" != /dev/fd/* ]]; then
+    if [[ -n "$source_file" && -f "$source_file" && "$source_file" != /dev/fd/* \
+        && "$source_file" != /dev/stdin && "$source_file" != /proc/self/fd/* ]]; then
         cp -- "$source_file" "$temporary"
     else
-        curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 "$REMOTE_URL" -o "$temporary"
+        info "正在下载并校验 GitHub 正式版本……"
+        download_verified_release "$temporary" || fatal "正式版本下载或 SHA-256 校验失败，安装已安全停止。"
     fi
     grep -q '^# VPS_TELEGRAM_MONITOR_SCRIPT=1$' "$temporary" || fatal "下载文件校验失败。"
     bash -n "$temporary" || fatal "脚本语法校验失败。"
@@ -844,7 +905,14 @@ install_script_source() {
 }
 
 install_app() {
-    require_root; verify_ubuntu; ensure_dependencies
+    require_root
+    if [[ -f "$SCRIPT_PATH" && -x "$SCRIPT_PATH" && -e "$BIN_PATH" \
+        && -r "$TOKEN_FILE" && -r "$CHAT_ID_FILE" && -r "$SERVER_NAME_FILE" && -r "$INTERFACE_FILE" ]]; then
+        info "检测到现有安装，将保留 TG 配置和统计数据并执行安全更新。"
+        run_update
+        return
+    fi
+    verify_ubuntu; ensure_dependencies
     [[ -r /dev/tty && -w /dev/tty ]] || fatal "需要交互式 SSH 终端，当前环境无法安全读取 Token。"
     WORK_DIR="$(mktemp -d -t vps-monitor-install.XXXXXXXX)"; chmod 0700 "$WORK_DIR"; trap cleanup_work_dir EXIT
     local setup_token setup_chat_id setup_interface setup_server_name create_service_account=0
@@ -900,6 +968,98 @@ install_app() {
     printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每月 1 日发送月报；SSH 登录成功时立即提醒。\n'
     printf '查看状态：sudo vps-monitor status\n查看日志：sudo journalctl -u "vps-monitor-*" --since today\n\n'
     warn "Token 与 UID 仅保存在受限配置文件中，日志不会输出这些信息。"
+}
+
+apply_installed_update() {
+    require_root
+    is_managed_service_account || fatal "专用系统账户状态异常，已拒绝更新。"
+    load_config
+    WORK_DIR="$(mktemp -d -t vps-monitor-update-apply.XXXXXXXX)"
+    chmod 0700 "$WORK_DIR"
+    trap cleanup_work_dir EXIT
+    install_systemd_units
+    install_login_alert_hook
+    systemctl daemon-reload
+    systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null
+}
+
+restore_update_backup() {
+    local backup_dir="$1" unit
+    install -o root -g root -m 0755 "${backup_dir}/TG-check-notify.sh" "$SCRIPT_PATH" || return 1
+    install -o root -g root -m 0755 "${backup_dir}/login-alert-hook" "$LOGIN_HOOK_PATH" || return 1
+    for unit in vps-monitor-{collect,report,monthly}.{service,timer}; do
+        install -o root -g root -m 0644 "${backup_dir}/units/${unit}" "${SYSTEMD_DIR}/${unit}" || return 1
+    done
+    ln -sfn "$SCRIPT_PATH" "$BIN_PATH" || return 1
+    systemctl daemon-reload || return 1
+    systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null || return 1
+}
+
+run_update() {
+    require_root; verify_ubuntu; ensure_dependencies
+    [[ -f "$SCRIPT_PATH" && -x "$SCRIPT_PATH" && -e "$BIN_PATH" ]] \
+        || fatal "未检测到完整安装，请先运行 README 中的一键安装命令。"
+    is_managed_service_account || fatal "专用系统账户状态异常，为避免影响其他程序，更新已停止。"
+    load_config
+
+    WORK_DIR="$(mktemp -d -t vps-monitor-update.XXXXXXXX)"
+    chmod 0700 "$WORK_DIR"
+    trap cleanup_work_dir EXIT
+    local downloaded="${WORK_DIR}/TG-check-notify.sh" backup_dir="${WORK_DIR}/backup"
+    local installed_version release_version unit
+
+    info "正在检查 GitHub 正式版本并验证 SHA-256……"
+    download_verified_release "$downloaded" || fatal "正式版本下载或 SHA-256 校验失败，现有程序未被修改。"
+    installed_version="$(script_version "$SCRIPT_PATH")" || fatal "无法识别当前安装版本，现有程序未被修改。"
+    release_version="$(script_version "$downloaded")" || fatal "无法识别正式版本，现有程序未被修改。"
+    if [[ "$release_version" == "$installed_version" ]]; then
+        success "当前已经是最新版 v${installed_version}，配置和统计数据均未改动。"
+        return
+    fi
+    version_is_newer "$release_version" "$installed_version" \
+        || fatal "正式版本 v${release_version} 低于当前版本 v${installed_version}，已拒绝自动降级。"
+
+    mkdir -p "${backup_dir}/units"
+    [[ -f "$LOGIN_HOOK_PATH" ]] || fatal "SSH 登录提醒组件不完整，现有程序未被修改。"
+    cp -p -- "$SCRIPT_PATH" "${backup_dir}/TG-check-notify.sh"
+    cp -p -- "$LOGIN_HOOK_PATH" "${backup_dir}/login-alert-hook"
+    for unit in vps-monitor-{collect,report,monthly}.{service,timer}; do
+        [[ -f "${SYSTEMD_DIR}/${unit}" ]] || fatal "定时任务 ${unit} 不完整，现有程序未被修改。"
+        cp -p -- "${SYSTEMD_DIR}/${unit}" "${backup_dir}/units/${unit}"
+    done
+
+    systemctl stop vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
+    UPDATE_TIMERS_STOPPED=1
+    local wait_deadline=$((SECONDS + 240)) active_service
+    while :; do
+        active_service=0
+        for unit in vps-monitor-{collect,report,monthly}.service; do
+            systemctl is-active --quiet "$unit" && active_service=1
+        done
+        (( active_service == 0 )) && break
+        if (( SECONDS >= wait_deadline )); then
+            systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
+            fatal "监控任务长时间未结束，更新已取消，现有程序未被修改。"
+        fi
+        sleep 1
+    done
+
+    info "正在从 v${installed_version} 安全更新到 v${release_version}……"
+    if install -o root -g root -m 0755 "$downloaded" "$SCRIPT_PATH" \
+        && ln -sfn "$SCRIPT_PATH" "$BIN_PATH" \
+        && "$SCRIPT_PATH" __apply-update; then
+        UPDATE_TIMERS_STOPPED=0
+        success "更新完成：v${installed_version} → v${release_version}。"
+        printf 'TG Token、UID、历史流量和 SSH 登录提醒均已保留。\n'
+        return
+    fi
+
+    warn "新版本应用失败，正在恢复更新前的完整文件……"
+    if restore_update_backup "$backup_dir"; then
+        UPDATE_TIMERS_STOPPED=0
+        fatal "更新失败，已自动恢复 v${installed_version}，配置和统计数据未丢失。"
+    fi
+    fatal "更新和自动恢复均未完整完成，请保留此输出并检查 systemd 状态；配置与统计目录未被删除。"
 }
 
 uninstall_app() {
@@ -965,7 +1125,7 @@ uninstall_app() {
 }
 
 usage() {
-    printf '用法：vps-monitor {collect|report|monthly|test|status|uninstall}\n'
+    printf '用法：vps-monitor {collect|report|monthly|test|status|update|uninstall}\n'
 }
 
 main() {
@@ -977,6 +1137,8 @@ main() {
         test) run_test_message ;;
         login-alert) run_login_alert ;;
         status) run_status ;;
+        update) run_update ;;
+        __apply-update) apply_installed_update ;;
         uninstall|--uninstall) uninstall_app ;;
         --version) printf 'vps-monitor %s\n' "$VERSION" ;;
         *) usage; exit 2 ;;

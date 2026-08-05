@@ -36,12 +36,30 @@ assert_equal "10" "$update_cursor" "Telegram start cursor"
 assert_equal "987654321" "$matched_uid" "Telegram secure start UID"
 
 expected_two_hour=$'测试服务器\n进站速度: 10.15 MB/s\n出站速度: 10.07 MB/s\n总流量: 2.51 TB\nCPU利用率: 29%'
-actual_two_hour="$(format_two_hour_message 76629934080 76025954304 29 100 2759774185718)"
+actual_two_hour="$(format_two_hour_message 73080000000 72504000000 29 100 2510000000000)"
 assert_equal "$expected_two_hour" "$actual_two_hour" "two-hour message format"
 
 expected_month=$'测试服务器 2026年8月流量报告\n进站流量: 1.42 TB\n出站流量: 1.09 TB\n总流量: 2.51 TB\n平均CPU利用率: 29%'
-actual_month="$(format_month_message 2026-08 1561306511442 1198467674276 29 100)"
+actual_month="$(format_month_message 2026-08 1420000000000 1090000000000 29 100)"
 assert_equal "$expected_month" "$actual_month" "monthly message format"
+
+version_is_newer 1.5.0 1.4.9 || { printf 'FAIL: newer version was rejected\n' >&2; exit 1; }
+if version_is_newer 1.5.0 1.5.0 || version_is_newer 1.4.9 1.5.0; then
+    printf 'FAIL: equal or older version was accepted as newer\n' >&2
+    exit 1
+fi
+
+release_script="${TEST_DIR}/release-script"
+release_checksum="${TEST_DIR}/release-checksum"
+printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="9.8.7"\n' > "$release_script"
+printf '%s  TG-check-notify.sh\n' "$(sha256sum "$release_script" | awk '{print $1}')" > "$release_checksum"
+verify_release_script "$release_script" "$release_checksum" \
+    || { printf 'FAIL: valid release checksum was rejected\n' >&2; exit 1; }
+printf '%064d  TG-check-notify.sh\n' 0 > "$release_checksum"
+if verify_release_script "$release_script" "$release_checksum"; then
+    printf 'FAIL: invalid release checksum was accepted\n' >&2
+    exit 1
+fi
 
 login_epoch="$(date -d '2026-08-05 12:34:56 UTC' +%s)"
 login_time="$(date -d "@${login_epoch}" '+%F %T %Z')"
@@ -83,6 +101,26 @@ assert_equal "25.000000" "$busy" "window busy"
 assert_equal "100.000000" "$total" "window total"
 assert_equal "60.000000" "$coverage" "window coverage"
 
+(
+    DATA_DIR="${TEST_DIR}/silent-collector"
+    STATE_FILE="${DATA_DIR}/state.tsv"
+    SAMPLES_FILE="${DATA_DIR}/samples.tsv"
+    mkdir -p "$DATA_DIR"
+    INTERFACE=eth0
+    read_counters() {
+        CURRENT_BOOT=01234567-89ab-cdef-0123-456789abcdef
+        if [[ -f "$STATE_FILE" ]]; then
+            CURRENT_TS=1060; CURRENT_RX=7000; CURRENT_TX=4000
+            CURRENT_CPU_BUSY=50; CURRENT_CPU_TOTAL=200
+        else
+            CURRENT_TS=1000; CURRENT_RX=1000; CURRENT_TX=1000
+            CURRENT_CPU_BUSY=25; CURRENT_CPU_TOTAL=100
+        fi
+    }
+    assert_equal "" "$(collect_locked)" "baseline collector output"
+    assert_equal "" "$(collect_locked)" "routine collector output"
+)
+
 pwned="${TEST_DIR}/pwned"
 # shellcheck disable=SC2016 # Literal payload verifies that state is never executed.
 printf 'month_rx\t$(touch %s)\nmonth_tx\t42\n' "$pwned" > "$STATE_FILE"
@@ -114,6 +152,9 @@ BIN_PATH="/bin/true"
 install_systemd_units
 grep -Fxq 'OnCalendar=*-*-* 0/2:00:00' "${SYSTEMD_DIR}/vps-monitor-report.timer"
 grep -Fxq 'Persistent=true' "${SYSTEMD_DIR}/vps-monitor-report.timer"
+grep -Fxq 'OnBootSec=10s' "${SYSTEMD_DIR}/vps-monitor-collect.timer"
+grep -Fxq 'StandardOutput=null' "${SYSTEMD_DIR}/vps-monitor-collect.service"
+grep -Fxq 'StandardError=journal' "${SYSTEMD_DIR}/vps-monitor-collect.service"
 if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify "${SYSTEMD_DIR}"/*.service "${SYSTEMD_DIR}"/*.timer
 fi
