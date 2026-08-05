@@ -55,7 +55,7 @@ login_prefix=$'⚠️ VPS 登录提醒\n服务器: 测试服务器\n登录用户
 render_login_hook > "${TEST_DIR}/login-alert-hook"
 sh -n "${TEST_DIR}/login-alert-hook"
 grep -Fq -- '--no-block' "${TEST_DIR}/login-alert-hook"
-grep -Fq -- 'VPS_LOGIN_IP=$PAM_RHOST' "${TEST_DIR}/login-alert-hook"
+grep -Fq -- "VPS_LOGIN_IP=\$PAM_RHOST" "${TEST_DIR}/login-alert-hook"
 
 PAM_SSHD_FILE="${TEST_DIR}/pam-sshd"
 printf 'session required pam_unix.so\n' > "$PAM_SSHD_FILE"
