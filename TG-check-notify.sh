@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -20,6 +20,9 @@ INTERFACE_FILE="${CONFIG_DIR}/interface"
 STATE_FILE="${DATA_DIR}/state.tsv"
 SAMPLES_FILE="${DATA_DIR}/samples.tsv"
 LOCK_FILE="${DATA_DIR}/monitor.lock"
+LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
+PAM_SSHD_FILE="${VPS_MONITOR_PAM_SSHD_FILE:-/etc/pam.d/sshd}"
+PAM_MARKER="# vps-monitor SSH login alert"
 REMOTE_URL="https://raw.githubusercontent.com/wolfgang008/vps-monitor/main/TG-check-notify.sh"
 TELEGRAM_ROOT="https://api.telegram.org"
 WINDOW_SECONDS=7200
@@ -310,6 +313,13 @@ format_month_message() {
     '
 }
 
+format_login_message() {
+    local login_user="$1" login_ip="$2" login_epoch="$3" login_time
+    login_time="$(date -d "@${login_epoch}" '+%F %T %Z')"
+    printf '⚠️ VPS 登录提醒\n服务器: %s\n登录用户: %s\n来源IP: %s\n登录时间: %s' \
+        "$SERVER_NAME" "$login_user" "$login_ip" "$login_time"
+}
+
 send_message() {
     local message="$1" request_dir curl_config message_file response_file attempt wait_seconds result=1
     request_dir="$(mktemp -d "${DATA_DIR}/telegram.XXXXXXXX")"
@@ -395,15 +405,28 @@ run_test_message() {
     printf 'test: sent\n'
 }
 
+run_login_alert() {
+    load_config; acquire_lock
+    local login_user="${VPS_LOGIN_USER:-}" login_ip="${VPS_LOGIN_IP:-}" login_epoch message
+    [[ "$login_user" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || return 0
+    [[ "$login_ip" =~ ^[A-Fa-f0-9:.]{3,64}$ ]] || return 0
+    [[ "$login_ip" == *.* || "$login_ip" == *:* ]] || return 0
+    login_epoch="$(date +%s)"
+    message="$(format_login_message "$login_user" "$login_ip" "$login_epoch")"
+    send_message "$message"
+    printf 'login-alert: sent\n'
+}
+
 run_status() {
     load_config; load_state
-    local last_sample="暂无" last_report="暂无" sample_count=0 state_size=0
+    local last_sample="暂无" last_report="暂无" sample_count=0 state_size=0 login_alert="未启用"
     (( LAST_TS > 0 )) && last_sample="$(date -d "@${LAST_TS}" '+%F %T %Z')"
     (( LAST_REPORT > 0 )) && last_report="$(date -d "@${LAST_REPORT}" '+%F %T %Z')"
     [[ -r "$SAMPLES_FILE" ]] && sample_count="$(wc -l < "$SAMPLES_FILE")"
     [[ -r "$STATE_FILE" ]] && state_size="$(wc -c < "$STATE_FILE")"
-    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n最近采样: %s\n最近汇报: %s\n短期样本: %s 条\n状态文件: %s 字节\n' \
-        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$last_sample" "$last_report" "$sample_count" "$state_size"
+    [[ -r "$PAM_SSHD_FILE" ]] && grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE" && login_alert="已启用"
+    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n登录提醒: %s\n最近采样: %s\n最近汇报: %s\n短期样本: %s 条\n状态文件: %s 字节\n' \
+        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$login_alert" "$last_sample" "$last_report" "$sample_count" "$state_size"
 }
 
 setup_api_call() {
@@ -437,6 +460,88 @@ prepare_telegram_target() {
         "chat_id=${uid}" "text=VPS Monitor：Telegram UID 验证成功。" \
         || fatal "无法向此 UID 发送消息。请确认 UID 正确，并已向 @${bot_username} 发送 /start。"
     success "Telegram UID 验证通过" > /dev/tty
+}
+
+pam_login_line() {
+    printf 'session optional pam_exec.so quiet type=open_session %s' "$LOGIN_HOOK_PATH"
+}
+
+render_login_hook() {
+    cat <<'EOF'
+#!/bin/sh
+set -u
+
+[ "${PAM_TYPE:-}" = "open_session" ] || exit 0
+[ "${PAM_SERVICE:-}" = "sshd" ] || exit 0
+case "${PAM_USER:-}" in
+    ''|*[!A-Za-z0-9_.-]*) exit 0 ;;
+esac
+case "${PAM_RHOST:-}" in
+    ''|*[!A-Fa-f0-9:.]*) exit 0 ;;
+esac
+[ "${#PAM_USER}" -le 64 ] || exit 0
+[ "${#PAM_RHOST}" -le 64 ] || exit 0
+case "$PAM_RHOST" in
+    *.*|*:*) ;;
+    *) exit 0 ;;
+esac
+
+/usr/bin/systemd-run --quiet --no-block --collect \
+    --unit="vps-monitor-login-alert-$(date +%s%N)-$$" \
+    --description="VPS SSH login alert" \
+    --property=User=vpsmonitor \
+    --property=Group=vpsmonitor \
+    --property=Nice=10 \
+    --property=UMask=0077 \
+    --property=NoNewPrivileges=yes \
+    --property=PrivateTmp=yes \
+    --property=PrivateDevices=yes \
+    --property=ProtectSystem=strict \
+    --property=ProtectHome=yes \
+    --property=ProtectKernelTunables=yes \
+    --property=ProtectKernelModules=yes \
+    --property=ProtectKernelLogs=yes \
+    --property=ProtectControlGroups=yes \
+    --property=RestrictSUIDSGID=yes \
+    --property=LockPersonality=yes \
+    --property=RestrictNamespaces=yes \
+    --property="RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" \
+    --property=ReadWritePaths=/var/lib/vps-monitor \
+    --property=TimeoutStartSec=3min \
+    --setenv="VPS_LOGIN_USER=$PAM_USER" \
+    --setenv="VPS_LOGIN_IP=$PAM_RHOST" \
+    /usr/local/bin/vps-monitor login-alert >/dev/null 2>&1 || true
+
+exit 0
+EOF
+}
+
+ensure_pam_login_line() {
+    local line
+    line="$(pam_login_line)"
+    grep -Fqx "$line" "$PAM_SSHD_FILE" && return 0
+    printf '\n%s\n%s\n' "$PAM_MARKER" "$line" >> "$PAM_SSHD_FILE"
+}
+
+remove_pam_login_line() {
+    [[ -f "$PAM_SSHD_FILE" ]] || return 0
+    local line temporary
+    line="$(pam_login_line)"; temporary="$(mktemp -t vps-monitor-pam.XXXXXXXX)"
+    if ! awk -v marker="$PAM_MARKER" -v line="$line" '$0 != marker && $0 != line' \
+        "$PAM_SSHD_FILE" > "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    cat -- "$temporary" > "$PAM_SSHD_FILE"
+    rm -f -- "$temporary"
+}
+
+install_login_alert_hook() {
+    [[ -f "$PAM_SSHD_FILE" && -w "$PAM_SSHD_FILE" ]] || fatal "找不到可写的 SSH PAM 配置，无法启用登录提醒。"
+    render_login_hook > "${WORK_DIR}/login-alert-hook"
+    sh -n "${WORK_DIR}/login-alert-hook" || fatal "登录提醒钩子语法校验失败。"
+    install -o root -g root -m 0755 "${WORK_DIR}/login-alert-hook" "$LOGIN_HOOK_PATH"
+    ensure_pam_login_line
 }
 
 detect_interface() {
@@ -492,14 +597,17 @@ verify_ubuntu() {
 
 ensure_dependencies() {
     local missing=0 command_name
-    for command_name in curl ip flock python3 awk getent groupadd useradd runuser; do
+    for command_name in curl ip flock python3 awk getent groupadd useradd runuser systemd-run; do
         command -v "$command_name" >/dev/null || missing=1
     done
+    if ! dpkg-query -W -f='${Status}' libpam-modules 2>/dev/null | grep -Fq 'install ok installed'; then
+        missing=1
+    fi
     if (( missing == 1 )); then
         info "正在安装 Ubuntu 基础组件……"
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq bash curl ca-certificates iproute2 util-linux python3 gawk passwd
+        apt-get install -y -qq bash curl ca-certificates iproute2 util-linux python3 gawk passwd libpam-modules
     fi
     success "基础组件已就绪（运行时无第三方库）"
 }
@@ -687,16 +795,19 @@ install_app() {
     systemctl daemon-reload
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
     systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null
-    success "安装完成，Telegram UID 已验证"
-    printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每月 1 日发送月报。\n'
+    install_login_alert_hook
+    success "安装完成，Telegram UID 与 SSH 登录提醒已验证"
+    printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每月 1 日发送月报；SSH 登录成功时立即提醒。\n'
     printf '查看状态：sudo vps-monitor status\n查看日志：sudo journalctl -u "vps-monitor-*" --since today\n\n'
     warn "Token 与 UID 仅保存在受限配置文件中，日志不会输出这些信息。"
 }
 
 uninstall_app() {
     require_root
+    remove_pam_login_line
     systemctl disable --now vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
     systemctl stop vps-monitor-{collect,report,monthly}.service >/dev/null 2>&1 || true
+    systemctl stop 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
     rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,monthly}.{service,timer} "$BIN_PATH"
     rm -rf -- "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
     if getent passwd "$SERVICE_USER" >/dev/null; then
@@ -706,7 +817,7 @@ uninstall_app() {
         groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
     fi
     systemctl daemon-reload
-    success "程序、Token 和统计文件已全部删除。"
+    success "程序、登录提醒、Token 和统计文件已全部删除。"
 }
 
 usage() {
@@ -720,6 +831,7 @@ main() {
         report) run_report ;;
         monthly) run_monthly ;;
         test) run_test_message ;;
+        login-alert) run_login_alert ;;
         status) run_status ;;
         uninstall|--uninstall) uninstall_app ;;
         --version) printf 'vps-monitor %s\n' "$VERSION" ;;

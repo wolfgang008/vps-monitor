@@ -12,6 +12,7 @@ DATA_DIR="$TEST_DIR"
 STATE_FILE="${DATA_DIR}/state.tsv"
 SAMPLES_FILE="${DATA_DIR}/samples.tsv"
 export SERVER_NAME="测试服务器"
+export TZ=UTC
 
 assert_equal() {
     local expected="$1" actual="$2" label="$3"
@@ -35,6 +36,38 @@ expected_month=$'测试服务器 2026年8月流量报告\n进站流量: 1.42 TB\
 actual_month="$(format_month_message 2026-08 1561306511442 1198467674276 29 100)"
 assert_equal "$expected_month" "$actual_month" "monthly message format"
 
+login_epoch="$(date -d '2026-08-05 12:34:56 UTC' +%s)"
+login_time="$(date -d "@${login_epoch}" '+%F %T %Z')"
+expected_login="$(printf '⚠️ VPS 登录提醒\n服务器: 测试服务器\n登录用户: root\n来源IP: 203.0.113.8\n登录时间: %s' "$login_time")"
+actual_login="$(format_login_message root 203.0.113.8 "$login_epoch")"
+assert_equal "$expected_login" "$actual_login" "SSH login alert format"
+
+(
+    load_config() { :; }
+    acquire_lock() { :; }
+    send_message() { printf '%s' "$1" > "${TEST_DIR}/captured-login-alert"; }
+    VPS_LOGIN_USER=root VPS_LOGIN_IP=203.0.113.8 run_login_alert >/dev/null
+)
+login_prefix=$'⚠️ VPS 登录提醒\n服务器: 测试服务器\n登录用户: root\n来源IP: 203.0.113.8\n登录时间: '
+[[ "$(<"${TEST_DIR}/captured-login-alert")" == "${login_prefix}"* ]] \
+    || { printf 'FAIL: SSH login alert delivery\n' >&2; exit 1; }
+
+render_login_hook > "${TEST_DIR}/login-alert-hook"
+sh -n "${TEST_DIR}/login-alert-hook"
+grep -Fq -- '--no-block' "${TEST_DIR}/login-alert-hook"
+grep -Fq -- 'VPS_LOGIN_IP=$PAM_RHOST' "${TEST_DIR}/login-alert-hook"
+
+PAM_SSHD_FILE="${TEST_DIR}/pam-sshd"
+printf 'session required pam_unix.so\n' > "$PAM_SSHD_FILE"
+ensure_pam_login_line
+ensure_pam_login_line
+assert_equal "1" "$(grep -Fxc "$(pam_login_line)" "$PAM_SSHD_FILE")" "PAM hook is idempotent"
+remove_pam_login_line
+if grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE"; then
+    printf 'FAIL: PAM hook was not removed\n' >&2
+    exit 1
+fi
+
 printf '1000\t1060\t6000\t3000\t25\t100\n' > "$SAMPLES_FILE"
 read -r rx tx busy total coverage <<< "$(calculate_window 1060)"
 assert_equal "6000.000000" "$rx" "window rx"
@@ -51,7 +84,6 @@ assert_equal "0" "$MONTH_RX" "invalid state rejected"
 assert_equal "42" "$MONTH_TX" "valid state accepted"
 [[ ! -e "$pwned" ]] || { printf 'FAIL: state file was executed\n' >&2; exit 1; }
 
-export TZ=UTC
 STATE_MONTH="2026-07"
 MONTH_RX=100; MONTH_TX=200; MONTH_CPU_BUSY=10; MONTH_CPU_TOTAL=50; MONTH_SECONDS=60
 LAST_TS="$(date -d '2026-07-31 23:55:00 UTC' +%s)"
