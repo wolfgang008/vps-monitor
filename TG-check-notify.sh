@@ -721,8 +721,9 @@ verify_supported_os() {
         *) fatal "仅支持 Ubuntu 和 Debian 12，当前为 ${PRETTY_NAME:-未知系统}。" ;;
     esac
     command -v systemctl >/dev/null || fatal "系统未使用 systemd。"
-    command -v apt-get >/dev/null && command -v dpkg-query >/dev/null \
-        || fatal "系统缺少 apt/dpkg 包管理工具。"
+    if ! command -v apt-get >/dev/null || ! command -v dpkg-query >/dev/null; then
+        fatal "系统缺少 apt/dpkg 包管理工具。"
+    fi
     success "系统检查通过：${PRETTY_NAME:-Linux}"
 }
 
