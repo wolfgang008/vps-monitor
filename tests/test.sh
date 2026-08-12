@@ -397,6 +397,7 @@ fi
     candidate="${REPAIR_ROOT}/candidate.sh"
     export REPAIR_HOOK="$LOGIN_HOOK_PATH"
     mkdir -p "$(dirname -- "$BIN_PATH")" "$INSTALL_DIR" "$SYSTEMD_DIR"
+    # shellcheck disable=SC2016 # The generated candidate expands these values when it runs.
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         '# VPS_TELEGRAM_MONITOR_SCRIPT=1' \
