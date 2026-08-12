@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.6.1"
+VERSION="1.6.2"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -69,6 +69,13 @@ warn() { printf '%s[注意]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 fatal() { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 is_telegram_uid() { [[ "${1:-}" =~ ^[1-9][0-9]{0,19}$ ]]; }
+has_interactive_terminal() {
+    { : < /dev/tty; } 2>/dev/null && { : > /dev/tty; } 2>/dev/null
+}
+is_server_name() {
+    local value="${1:-}" control_pattern=$'[\001-\037\177]'
+    [[ ${#value} -le 80 && "$value" =~ [^[:space:]] && ! "$value" =~ $control_pattern ]]
+}
 
 cleanup_work_dir() {
     if (( UPDATE_TIMERS_STOPPED == 1 )) && (( EUID == 0 )) && command -v systemctl >/dev/null; then
@@ -89,8 +96,7 @@ load_config() {
     [[ "$TOKEN" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]] || fatal "Bot Token 配置格式无效。"
     is_telegram_uid "$CHAT_ID" || fatal "Telegram UID 配置格式无效。"
     [[ "$INTERFACE" =~ ^[A-Za-z0-9_.:@-]{1,64}$ ]] || fatal "网卡配置格式无效。"
-    [[ -n "$SERVER_NAME" && ${#SERVER_NAME} -le 80 && "$SERVER_NAME" != *$'\n'* ]] \
-        || fatal "服务器名称配置无效。"
+    is_server_name "$SERVER_NAME" || fatal "服务器名称配置无效。"
 }
 
 reset_state_defaults() {
@@ -727,31 +733,19 @@ detect_interface() {
     printf '%s' "$interface"
 }
 
-detect_server_name() {
-    local response="${WORK_DIR}/ipwho.json" name
-    if curl --proto '=https' --tlsv1.2 -fsS --connect-timeout 5 --max-time 8 \
-        'https://ipwho.is/' -o "$response"; then
-        name="$(python3 - "$response" <<'PY'
-import json, re, socket, sys
-countries = {"AU":"澳大利亚","CA":"加拿大","DE":"德国","FI":"芬兰","FR":"法国","GB":"英国","HK":"香港","IN":"印度","JP":"日本","KR":"韩国","NL":"荷兰","SG":"新加坡","TW":"台湾","US":"美国"}
-try:
-    data = json.load(open(sys.argv[1], encoding="utf-8"))
-    country = countries.get(str(data.get("country_code", "")).upper(), str(data.get("country", "")).strip())
-    connection = data.get("connection") or {}
-    provider = str(connection.get("isp") or connection.get("org") or "VPS")
-    provider = re.sub(r"\b(LLC|LTD|LIMITED|INC|CORP|CORPORATION|CO\.?|GMBH)\b", "", provider, flags=re.I)
-    provider = "".join(re.findall(r"[A-Za-z0-9\u4e00-\u9fff._-]+", provider)[:2])[:24] or "VPS"
-    value = (country + provider)[:80]
-except Exception:
-    value = socket.gethostname()[:80] or "VPS"
-print(value.replace("\n", ""))
-PY
-)"
-    else
-        name="$(hostname | tr -cd 'A-Za-z0-9._-')"
-    fi
-    [[ -n "$name" ]] || name="VPS"
-    printf '%s' "$name"
+prompt_server_name() {
+    local value
+    while true; do
+        printf '请输入服务器名称（例如：主服务器，最多 80 个字符）：' > /dev/tty
+        if ! IFS= read -r value < /dev/tty; then
+            fatal "未能读取服务器名称，安装已停止。"
+        fi
+        if is_server_name "$value"; then
+            printf '%s' "$value"
+            return
+        fi
+        warn "名称不能为空、不能只有空格或包含控制字符，请重新输入。" > /dev/tty
+    done
 }
 
 require_root() {
@@ -1033,17 +1027,18 @@ install_app() {
         return
     fi
     verify_supported_os; ensure_dependencies
-    [[ -r /dev/tty && -w /dev/tty ]] || fatal "需要交互式 SSH 终端，当前环境无法安全读取 Token。"
+    has_interactive_terminal || fatal "需要交互式 SSH 终端，当前环境无法安全读取安装信息。"
     WORK_DIR="$(mktemp -d -t vps-monitor-install.XXXXXXXX)"; chmod 0700 "$WORK_DIR"; trap cleanup_work_dir EXIT
     local setup_token setup_chat_id setup_interface setup_server_name create_service_account=0
     printf '\n╭────────────────────────────────────╮\n│  VPS Telegram Monitor 一键安装    │\n╰────────────────────────────────────╯\n\n' > /dev/tty
+    setup_server_name="$(prompt_server_name)"
     read -r -s -p '请输入 Bot Token（输入不会显示）：' setup_token < /dev/tty
     printf '\n' > /dev/tty
     [[ "$setup_token" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]] || fatal "Token 格式不正确。"
     setup_chat_id="$(resolve_telegram_uid "$setup_token")"
-    info "正在自动识别公网网卡、国家和服务商……"
-    setup_interface="$(detect_interface)"; setup_server_name="$(detect_server_name)"
-    success "识别结果：${setup_server_name}（${setup_interface}）"
+    info "正在自动识别公网网卡……"
+    setup_interface="$(detect_interface)"
+    success "服务器名称：${setup_server_name}；监控网卡：${setup_interface}"
 
     if getent passwd "$SERVICE_USER" >/dev/null; then
         is_managed_service_account \
@@ -1215,6 +1210,27 @@ run_update() {
     fatal "更新和自动恢复均未完整完成，定时任务已保持停止；请保留此输出并检查 systemd 状态，配置与统计目录未被删除。"
 }
 
+rename_server() {
+    require_root
+    is_managed_service_account || fatal "未检测到完整安装，无法修改服务器名称。"
+    load_config
+    has_interactive_terminal || fatal "需要交互式 SSH 终端才能修改服务器名称。"
+
+    local new_name temporary
+    printf '当前服务器名称：%s\n' "$SERVER_NAME"
+    new_name="$(prompt_server_name)"
+    temporary="$(mktemp "${CONFIG_DIR}/server_name.XXXXXXXX")"
+    if ! printf '%s' "$new_name" > "$temporary" \
+        || ! chown root:"$SERVICE_USER" "$temporary" \
+        || ! chmod 0640 "$temporary" \
+        || ! mv -f -- "$temporary" "$SERVER_NAME_FILE"; then
+        rm -f -- "$temporary"
+        fatal "服务器名称保存失败，原配置未被修改。"
+    fi
+    success "服务器名称已修改为：${new_name}"
+    printf '下一次测速汇报、月报和登录提醒将使用新名称。\n'
+}
+
 uninstall_app() {
     require_root
     local managed_account=0 unit path pam_line
@@ -1278,7 +1294,7 @@ uninstall_app() {
 }
 
 usage() {
-    printf '用法：vps-monitor {collect|report|monthly|test|status|update|uninstall}\n'
+    printf '用法：vps-monitor {collect|report|monthly|test|status|rename|update|uninstall}\n'
 }
 
 main() {
@@ -1293,6 +1309,7 @@ main() {
         test) run_test_message ;;
         login-alert) run_login_alert ;;
         status) run_status ;;
+        rename) rename_server ;;
         update) run_update ;;
         __apply-update) apply_installed_update ;;
         uninstall|--uninstall) uninstall_app ;;

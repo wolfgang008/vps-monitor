@@ -12,6 +12,12 @@ curl -fsSL https://raw.githubusercontent.com/wolfgang008/vps-monitor/main/TG-che
 sudo vps-monitor update
 ```
 
+修改服务器名称：
+
+```bash
+sudo vps-monitor rename
+```
+
 卸载：
 
 ```bash

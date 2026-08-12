@@ -57,6 +57,55 @@ if is_telegram_uid "@example" || is_telegram_uid "012345" || is_telegram_uid "-1
     exit 1
 fi
 
+is_server_name "测试服务器" || { printf 'FAIL: valid Chinese server name rejected\n' >&2; exit 1; }
+is_server_name "My VPS 01" || { printf 'FAIL: valid spaced server name rejected\n' >&2; exit 1; }
+long_server_name="$(printf '%081d' 0)"
+if is_server_name "" || is_server_name "   " || is_server_name $'bad\tname' \
+    || is_server_name "$long_server_name"; then
+    printf 'FAIL: invalid server name accepted\n' >&2
+    exit 1
+fi
+if declare -F detect_server_name >/dev/null; then
+    printf 'FAIL: automatic server naming function still exists\n' >&2
+    exit 1
+fi
+
+test_rename_server() (
+    CONFIG_DIR="${TEST_DIR}/rename-config"
+    SERVER_NAME_FILE="${CONFIG_DIR}/server_name"
+    SERVICE_USER=vpsmonitor
+    mkdir -p "$CONFIG_DIR"
+    printf '%s' '旧名称' > "$SERVER_NAME_FILE"
+
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced rename function.
+    require_root() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced rename function.
+    is_managed_service_account() { return 0; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced rename function.
+    load_config() { SERVER_NAME="$(<"$SERVER_NAME_FILE")"; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced rename function.
+    has_interactive_terminal() { return 0; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced rename function.
+    prompt_server_name() { printf '%s' '手动输入的新名称'; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced rename function.
+    chown() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced rename function.
+    chmod() { :; }
+
+    rename_server >/dev/null
+    assert_equal "手动输入的新名称" "$(<"$SERVER_NAME_FILE")" "manual server rename"
+
+    printf '%s' '应当保留的名称' > "$SERVER_NAME_FILE"
+    # shellcheck disable=SC2317,SC2329 # Simulates a failed atomic configuration write.
+    chmod() { return 1; }
+    if (rename_server) >/dev/null 2>&1; then
+        printf 'FAIL: failed server rename was reported as successful\n' >&2
+        exit 1
+    fi
+    assert_equal "应当保留的名称" "$(<"$SERVER_NAME_FILE")" "failed rename preserves old name"
+)
+(test_rename_server)
+
 if (run_as_service_user_if_needed collect) >/dev/null 2>&1; then
     printf 'FAIL: non-service user was allowed to run a state-writing command\n' >&2
     exit 1
@@ -401,7 +450,7 @@ fi
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         '# VPS_TELEGRAM_MONITOR_SCRIPT=1' \
-        'VERSION="1.6.1"' \
+        'VERSION="1.6.2"' \
         'if [[ "${1:-}" == "__apply-update" ]]; then : > "$REPAIR_HOOK"; fi' > "$candidate"
     cp -- "$candidate" "$SCRIPT_PATH"
     chmod 0700 "$SCRIPT_PATH" "$candidate"
