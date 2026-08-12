@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.5.2"
+VERSION="1.6.0"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -709,13 +709,21 @@ is_managed_service_account() {
         && [[ "$account_shell" == /usr/sbin/nologin || "$account_shell" == /bin/false ]]
 }
 
-verify_ubuntu() {
-    [[ -r /etc/os-release ]] || fatal "无法识别操作系统。"
-    # shellcheck disable=SC1091
-    source /etc/os-release
-    [[ "${ID:-}" == "ubuntu" ]] || fatal "仅支持 Ubuntu，当前为 ${PRETTY_NAME:-未知系统}。"
+verify_supported_os() {
+    local os_release_file="${VPS_MONITOR_OS_RELEASE_FILE:-/etc/os-release}"
+    [[ -r "$os_release_file" ]] || fatal "无法识别操作系统。"
+    # shellcheck disable=SC1090 # The path is fixed in production and overridden only by tests.
+    source "$os_release_file"
+    case "${ID:-}:${VERSION_ID:-}" in
+        ubuntu:*) ;;
+        debian:12|debian:12.*) ;;
+        debian:*) fatal "仅支持 Debian 12，当前为 ${PRETTY_NAME:-未知系统}。" ;;
+        *) fatal "仅支持 Ubuntu 和 Debian 12，当前为 ${PRETTY_NAME:-未知系统}。" ;;
+    esac
     command -v systemctl >/dev/null || fatal "系统未使用 systemd。"
-    success "系统检查通过：${PRETTY_NAME:-Ubuntu}"
+    command -v apt-get >/dev/null && command -v dpkg-query >/dev/null \
+        || fatal "系统缺少 apt/dpkg 包管理工具。"
+    success "系统检查通过：${PRETTY_NAME:-Linux}"
 }
 
 ensure_dependencies() {
@@ -727,7 +735,7 @@ ensure_dependencies() {
         missing=1
     fi
     if (( missing == 1 )); then
-        info "正在安装 Ubuntu 基础组件……"
+        info "正在安装系统基础组件……"
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
         apt-get install -y -qq bash curl ca-certificates iproute2 util-linux python3 gawk passwd libpam-modules tar
@@ -948,7 +956,7 @@ install_app() {
         run_update
         return
     fi
-    verify_ubuntu; ensure_dependencies
+    verify_supported_os; ensure_dependencies
     [[ -r /dev/tty && -w /dev/tty ]] || fatal "需要交互式 SSH 终端，当前环境无法安全读取 Token。"
     WORK_DIR="$(mktemp -d -t vps-monitor-install.XXXXXXXX)"; chmod 0700 "$WORK_DIR"; trap cleanup_work_dir EXIT
     local setup_token setup_chat_id setup_interface setup_server_name create_service_account=0
@@ -1032,7 +1040,7 @@ restore_update_backup() {
 }
 
 run_update() {
-    require_root; verify_ubuntu; ensure_dependencies
+    require_root; verify_supported_os; ensure_dependencies
     exec 8>"$UPDATE_LOCK_FILE"
     flock -n 8 || fatal "另一个更新任务正在运行，请稍后再试。"
     [[ -f "$SCRIPT_PATH" && -x "$SCRIPT_PATH" && -e "$BIN_PATH" ]] \
@@ -1159,7 +1167,7 @@ uninstall_app() {
         fatal "请保留此输出并检查系统状态；脚本没有修改任何无关资源。"
     fi
     success "程序、定时任务、登录提醒、Token、统计数据和专用账户均已删除。"
-    warn "为避免影响系统，Ubuntu 公共组件、systemd 历史日志和 Telegram 聊天消息不会被删除。"
+    warn "为避免影响系统，公共组件、systemd 历史日志和 Telegram 聊天消息不会被删除。"
 }
 
 usage() {

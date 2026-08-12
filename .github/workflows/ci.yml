@@ -28,3 +28,25 @@ jobs:
         run: shellcheck TG-check-notify.sh tests/test.sh
       - name: Behavior tests
         run: bash tests/test.sh
+
+  debian-12-test:
+    runs-on: ubuntu-24.04
+    container: debian:12-slim
+    steps:
+      - name: Install test tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq bash ca-certificates coreutils curl gawk git iproute2 libpam-modules openssh-server passwd python3 shellcheck systemd tar util-linux
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Debian platform check
+        run: |
+          install -d -m 0755 /run/sshd
+          VPS_MONITOR_NO_MAIN=1 bash -c 'source ./TG-check-notify.sh; verify_supported_os >/dev/null; sshd_pam_is_enabled'
+      - name: Bash syntax
+        run: bash -n TG-check-notify.sh tests/test.sh
+      - name: Script checksum
+        run: sha256sum --check TG-check-notify.sh.sha256
+      - name: ShellCheck
+        run: shellcheck TG-check-notify.sh tests/test.sh
+      - name: Behavior tests
+        run: bash tests/test.sh

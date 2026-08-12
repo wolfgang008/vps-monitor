@@ -22,6 +22,28 @@ assert_equal() {
     fi
 }
 
+test_supported_os() (
+    # shellcheck disable=SC2317,SC2329 # Used by command -v inside the sourced check.
+    systemctl() { :; }
+    # shellcheck disable=SC2317,SC2329 # Used by command -v inside the sourced check.
+    apt-get() { :; }
+    # shellcheck disable=SC2317,SC2329 # Used by command -v inside the sourced check.
+    dpkg-query() { :; }
+    local os_release="${TEST_DIR}/os-release"
+    export VPS_MONITOR_OS_RELEASE_FILE="$os_release"
+
+    printf 'ID=ubuntu\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04 LTS"\n' > "$os_release"
+    verify_supported_os >/dev/null
+    printf 'ID=debian\nVERSION_ID="12"\nPRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n' > "$os_release"
+    verify_supported_os >/dev/null
+    printf 'ID=debian\nVERSION_ID="11"\nPRETTY_NAME="Debian GNU/Linux 11 (bullseye)"\n' > "$os_release"
+    if (verify_supported_os) >/dev/null 2>&1; then
+        printf 'FAIL: unsupported Debian version was accepted\n' >&2
+        exit 1
+    fi
+)
+test_supported_os
+
 is_telegram_uid "123456789" || { printf 'FAIL: valid Telegram UID rejected\n' >&2; exit 1; }
 if is_telegram_uid "@example" || is_telegram_uid "012345" || is_telegram_uid "-100123"; then
     printf 'FAIL: invalid Telegram UID accepted\n' >&2
@@ -261,7 +283,7 @@ fi
     # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     require_root() { :; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
-    verify_ubuntu() { :; }
+    verify_supported_os() { :; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     ensure_dependencies() { :; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
