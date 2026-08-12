@@ -32,6 +32,8 @@ test_supported_os() (
     local os_release="${TEST_DIR}/os-release"
     export VPS_MONITOR_OS_RELEASE_FILE="$os_release"
 
+    printf 'ID=ubuntu\nVERSION_ID="22.04"\nPRETTY_NAME="Ubuntu 22.04 LTS"\n' > "$os_release"
+    verify_supported_os >/dev/null
     printf 'ID=ubuntu\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04 LTS"\n' > "$os_release"
     verify_supported_os >/dev/null
     printf 'ID=debian\nVERSION_ID="12"\nPRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n' > "$os_release"
@@ -39,6 +41,11 @@ test_supported_os() (
     printf 'ID=debian\nVERSION_ID="11"\nPRETTY_NAME="Debian GNU/Linux 11 (bullseye)"\n' > "$os_release"
     if (verify_supported_os) >/dev/null 2>&1; then
         printf 'FAIL: unsupported Debian version was accepted\n' >&2
+        exit 1
+    fi
+    printf 'ID=ubuntu\nVERSION_ID="20.04"\nPRETTY_NAME="Ubuntu 20.04 LTS"\n' > "$os_release"
+    if (verify_supported_os) >/dev/null 2>&1; then
+        printf 'FAIL: unsupported Ubuntu version was accepted\n' >&2
         exit 1
     fi
 )
@@ -149,11 +156,13 @@ test_status() {
     # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     load_config() { :; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
-    load_state() { LAST_TS=0; LAST_REPORT=0; }
+    load_state() { LAST_TS="$(date +%s)"; LAST_REPORT=0; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
-    systemctl() { return 0; }
+    systemctl() { [[ "${1:-}" != is-failed ]]; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     sshd_pam_is_enabled() { return 0; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
+    monitored_interface_is_readable() { return 0; }
     local DATA_DIR="${TEST_DIR}/status"
     local STATE_FILE="${DATA_DIR}/state.tsv"
     local SAMPLES_FILE="${DATA_DIR}/samples.tsv"
@@ -165,6 +174,22 @@ test_status() {
     status_output="$(run_status)"
     grep -Fqx '定时任务: 正常' <<< "$status_output"
     grep -Fqx '登录提醒: 正常' <<< "$status_output"
+    # shellcheck disable=SC2317,SC2329 # Replaces the healthy state for the stale-state check.
+    load_state() { LAST_TS=0; LAST_REPORT=0; }
+    status_output="$(run_status)"
+    grep -Fqx '定时任务: 异常' <<< "$status_output"
+    # shellcheck disable=SC2317,SC2329 # Replaces the stale state for the service-result check.
+    load_state() { LAST_TS="$(date +%s)"; LAST_REPORT=0; }
+    # shellcheck disable=SC2317,SC2329 # Simulates a service waiting to restart after failure.
+    systemctl() {
+        case "${1:-}" in
+            is-failed) return 1 ;;
+            show) printf 'exit-code\n' ;;
+            *) return 0 ;;
+        esac
+    }
+    status_output="$(run_status)"
+    grep -Fqx '定时任务: 异常' <<< "$status_output"
 }
 (test_status)
 
@@ -219,6 +244,42 @@ assert_equal "1800" "$MONTH_CPU_BUSY" "long-gap new month cpu split"
 assert_equal "3600" "$MONTH_CPU_TOTAL" "long-gap new month cpu total split"
 assert_equal "3600" "$MONTH_SECONDS" "long-gap new month duration split"
 
+STATE_MONTH="2026-06"
+MONTH_RX=0; MONTH_TX=0; MONTH_CPU_BUSY=0; MONTH_CPU_TOTAL=0; MONTH_SECONDS=0
+LAST_TS="$(date -d '2026-06-30 23:00:00 UTC' +%s)"
+CURRENT_TS="$(date -d '2026-08-01 01:00:00 UTC' +%s)"
+multi_elapsed=$((CURRENT_TS - LAST_TS))
+multi_rx=$((multi_elapsed * 10000000)); multi_tx=$((multi_elapsed * 5000000))
+add_month_delta 2026-08 "$multi_elapsed" "$multi_rx" "$multi_tx" \
+    "$multi_elapsed" "$((multi_elapsed * 2))"
+read -r archived_rx archived_tx archived_busy archived_total archived_seconds < "${DATA_DIR}/month-2026-06.tsv"
+assert_equal "36000000000" "$archived_rx" "multi-month June rx without overflow"
+assert_equal "18000000000" "$archived_tx" "multi-month June tx without overflow"
+assert_equal "3600" "$archived_seconds" "multi-month June duration"
+read -r archived_rx archived_tx archived_busy archived_total archived_seconds < "${DATA_DIR}/month-2026-07.tsv"
+assert_equal "26784000000000" "$archived_rx" "multi-month July rx archive"
+assert_equal "13392000000000" "$archived_tx" "multi-month July tx archive"
+assert_equal "2678400" "$archived_seconds" "multi-month July duration"
+assert_equal "2026-08" "$STATE_MONTH" "multi-month current month"
+assert_equal "36000000000" "$MONTH_RX" "multi-month August rx"
+assert_equal "18000000000" "$MONTH_TX" "multi-month August tx"
+assert_equal "3600" "$MONTH_SECONDS" "multi-month August duration"
+
+monthly_queue="${TEST_DIR}/monthly-queue"
+mkdir -p "$monthly_queue"
+DATA_DIR="$monthly_queue"
+queue_current="$(date +%Y-%m)"
+queue_recent="$(date -d "${queue_current}-01 -1 month" +%Y-%m)"
+queue_oldest="$(date -d "${queue_current}-01 -2 months" +%Y-%m)"
+: > "${DATA_DIR}/month-${queue_recent}.tsv"
+: > "${DATA_DIR}/month-${queue_oldest}.tsv"
+assert_equal "$queue_oldest" "$(oldest_unsent_month)" "oldest monthly report is retried first"
+: > "${DATA_DIR}/sent-${queue_oldest}"
+assert_equal "$queue_recent" "$(oldest_unsent_month)" "monthly queue advances after marker"
+DATA_DIR="$TEST_DIR"
+STATE_FILE="${DATA_DIR}/state.tsv"
+SAMPLES_FILE="${DATA_DIR}/samples.tsv"
+
 SYSTEMD_DIR="${TEST_DIR}/systemd"
 BIN_PATH="/bin/true"
 install_systemd_units
@@ -227,6 +288,7 @@ grep -Fxq 'Persistent=true' "${SYSTEMD_DIR}/vps-monitor-report.timer"
 grep -Fxq 'OnBootSec=10s' "${SYSTEMD_DIR}/vps-monitor-collect.timer"
 grep -Fxq 'StandardOutput=null' "${SYSTEMD_DIR}/vps-monitor-collect.service"
 grep -Fxq 'StandardError=journal' "${SYSTEMD_DIR}/vps-monitor-collect.service"
+grep -Fxq 'OnCalendar=*-*-* 00:05:00' "${SYSTEMD_DIR}/vps-monitor-monthly.timer"
 if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify "${SYSTEMD_DIR}"/*.service "${SYSTEMD_DIR}"/*.timer
 fi
@@ -269,13 +331,14 @@ fi
     LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
     SYSTEMD_DIR="${UPDATE_ROOT}/systemd"
     UPDATE_LOCK_FILE="${UPDATE_ROOT}/update.lock"
+    PAM_SSHD_FILE="${UPDATE_ROOT}/pam-sshd"
     candidate="${UPDATE_ROOT}/candidate.sh"
     mkdir -p "$(dirname -- "$BIN_PATH")" "$INSTALL_DIR" "$SYSTEMD_DIR"
     printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.5.1"\nexit 0\n' > "$SCRIPT_PATH"
     printf '#!/usr/bin/env sh\nexit 0\n' > "$LOGIN_HOOK_PATH"
     printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.5.2"\nexit 1\n' > "$candidate"
     chmod 0700 "$SCRIPT_PATH" "$LOGIN_HOOK_PATH" "$candidate"
-    : > "$BIN_PATH"
+    : > "$BIN_PATH"; : > "$PAM_SSHD_FILE"
     for unit_name in vps-monitor-{collect,report,monthly}.{service,timer}; do
         printf 'old unit %s\n' "$unit_name" > "${SYSTEMD_DIR}/${unit_name}"
     done
@@ -320,6 +383,63 @@ fi
         grep -Fqx "old unit ${unit_name}" "${SYSTEMD_DIR}/${unit_name}" \
             || { printf 'FAIL: failed update did not restore %s\n' "$unit_name" >&2; exit 1; }
     done
+)
+
+(
+    REPAIR_ROOT="${TEST_DIR}/same-version-repair"
+    SCRIPT_PATH="${REPAIR_ROOT}/installed.sh"
+    BIN_PATH="${REPAIR_ROOT}/bin/vps-monitor"
+    INSTALL_DIR="${REPAIR_ROOT}/lib"
+    LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
+    SYSTEMD_DIR="${REPAIR_ROOT}/systemd"
+    UPDATE_LOCK_FILE="${REPAIR_ROOT}/update.lock"
+    PAM_SSHD_FILE="${REPAIR_ROOT}/pam-sshd"
+    candidate="${REPAIR_ROOT}/candidate.sh"
+    export REPAIR_HOOK="$LOGIN_HOOK_PATH"
+    mkdir -p "$(dirname -- "$BIN_PATH")" "$INSTALL_DIR" "$SYSTEMD_DIR"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        '# VPS_TELEGRAM_MONITOR_SCRIPT=1' \
+        'VERSION="1.6.1"' \
+        'if [[ "${1:-}" == "__apply-update" ]]; then : > "$REPAIR_HOOK"; fi' > "$candidate"
+    cp -- "$candidate" "$SCRIPT_PATH"
+    chmod 0700 "$SCRIPT_PATH" "$candidate"
+    : > "$BIN_PATH"; : > "$PAM_SSHD_FILE"
+
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    require_root() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    verify_supported_os() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    ensure_dependencies() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    is_managed_service_account() { return 0; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    load_config() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    download_verified_main() { command cp -- "$candidate" "$1"; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    flock() { return 0; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    systemctl() { [[ "${1:-}" != is-active ]]; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    ln() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
+    install() {
+        while (( $# > 2 )); do
+            case "$1" in
+                -o|-g|-m) shift 2 ;;
+                --) shift; break ;;
+                *) break ;;
+            esac
+        done
+        command cp -- "$1" "$2"
+        command chmod 0700 "$2"
+    }
+
+    run_update >/dev/null
+    [[ -f "$LOGIN_HOOK_PATH" ]] \
+        || { printf 'FAIL: same-version update did not repair a missing login hook\n' >&2; exit 1; }
 )
 
 (

@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -55,6 +55,7 @@ MONTH_SECONDS=0
 LAST_REPORT=0
 WORK_DIR=""
 UPDATE_TIMERS_STOPPED=0
+PROPORTIONAL_RESULT=0
 
 if [[ -t 1 ]]; then
     C_GREEN=$'\033[32m'; C_BLUE=$'\033[36m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_RESET=$'\033[0m'
@@ -145,11 +146,17 @@ save_state() {
     mv -f -- "$temporary" "$STATE_FILE"
 }
 
+monitored_interface_is_readable() {
+    local rx_path="/sys/class/net/${INTERFACE}/statistics/rx_bytes"
+    local tx_path="/sys/class/net/${INTERFACE}/statistics/tx_bytes"
+    [[ -r "$rx_path" && -r "$tx_path" ]]
+}
+
 read_counters() {
     local cpu_label user nice system idle iowait irq softirq steal _
     local rx_path="/sys/class/net/${INTERFACE}/statistics/rx_bytes"
     local tx_path="/sys/class/net/${INTERFACE}/statistics/tx_bytes"
-    [[ -r "$rx_path" && -r "$tx_path" ]] || fatal "无法读取网卡 ${INTERFACE}，请重新安装以自动识别网卡。"
+    monitored_interface_is_readable || fatal "无法读取网卡 ${INTERFACE}，请重新安装以自动识别网卡。"
     CURRENT_RX="$(<"$rx_path")"
     CURRENT_TX="$(<"$tx_path")"
     read -r cpu_label user nice system idle iowait irq softirq steal _ < /proc/stat
@@ -185,6 +192,14 @@ roll_month_without_delta() {
     fi
 }
 
+proportional_floor() {
+    local value="$1" numerator="$2" denominator="$3"
+    local quotient=$((value / denominator)) remainder=$((value % denominator))
+    # Dividing before multiplying keeps realistic long-gap counter values
+    # within Bash's signed 64-bit arithmetic range.
+    PROPORTIONAL_RESULT=$((quotient * numerator + remainder * numerator / denominator))
+}
+
 add_month_delta() {
     local current_month="$1" elapsed="$2" rx_delta="$3" tx_delta="$4" busy_delta="$5" total_delta="$6"
     if [[ -z "$STATE_MONTH" || "$STATE_MONTH" == "$current_month" ]]; then
@@ -195,24 +210,49 @@ add_month_delta() {
         return
     fi
 
-    local previous_seconds=0 boundary previous_rx=0 previous_tx=0 previous_busy=0 previous_total=0
-    boundary="$(date -d "${current_month}-01 00:00:00" +%s 2>/dev/null || printf '0')"
-    if is_uint "$boundary" && (( LAST_TS < boundary && boundary < CURRENT_TS )); then
-        previous_seconds=$((boundary - LAST_TS))
-        previous_rx=$((rx_delta * previous_seconds / elapsed))
-        previous_tx=$((tx_delta * previous_seconds / elapsed))
-        previous_busy=$((busy_delta * previous_seconds / elapsed))
-        previous_total=$((total_delta * previous_seconds / elapsed))
-    fi
-    MONTH_RX=$((MONTH_RX + previous_rx)); MONTH_TX=$((MONTH_TX + previous_tx))
-    MONTH_CPU_BUSY=$((MONTH_CPU_BUSY + previous_busy)); MONTH_CPU_TOTAL=$((MONTH_CPU_TOTAL + previous_total))
-    MONTH_SECONDS=$((MONTH_SECONDS + previous_seconds))
-    archive_current_month
+    local cursor="$LAST_TS" segment_month segment_year segment_number next_year next_number next_month
+    local boundary segment_end segment_seconds cumulative_seconds
+    local cumulative_rx cumulative_tx cumulative_busy cumulative_total
+    local allocated_rx=0 allocated_tx=0 allocated_busy=0 allocated_total=0
+    local segment_rx segment_tx segment_busy segment_total
+    while (( cursor < CURRENT_TS )); do
+        segment_month="$(date -d "@${cursor}" +%Y-%m)" || fatal "无法计算跨月统计月份。"
+        segment_year="${segment_month%-*}"; segment_number="${segment_month#*-}"
+        next_year="$segment_year"; next_number=$((10#$segment_number + 1))
+        if (( next_number == 13 )); then
+            next_year=$((10#$segment_year + 1)); next_number=1
+        fi
+        printf -v next_month '%04d-%02d' "$next_year" "$next_number"
+        boundary="$(date -d "${next_month}-01 00:00:00" +%s)" \
+            || fatal "无法计算跨月统计边界。"
+        if ! is_uint "$boundary" || (( boundary <= cursor )); then
+            fatal "跨月统计边界异常。"
+        fi
+        segment_end="$boundary"
+        (( segment_end > CURRENT_TS )) && segment_end="$CURRENT_TS"
+        segment_seconds=$((segment_end - cursor))
+        cumulative_seconds=$((segment_end - LAST_TS))
 
-    STATE_MONTH="$current_month"
-    MONTH_RX=$((rx_delta - previous_rx)); MONTH_TX=$((tx_delta - previous_tx))
-    MONTH_CPU_BUSY=$((busy_delta - previous_busy)); MONTH_CPU_TOTAL=$((total_delta - previous_total))
-    MONTH_SECONDS=$((elapsed - previous_seconds))
+        proportional_floor "$rx_delta" "$cumulative_seconds" "$elapsed"; cumulative_rx="$PROPORTIONAL_RESULT"
+        proportional_floor "$tx_delta" "$cumulative_seconds" "$elapsed"; cumulative_tx="$PROPORTIONAL_RESULT"
+        proportional_floor "$busy_delta" "$cumulative_seconds" "$elapsed"; cumulative_busy="$PROPORTIONAL_RESULT"
+        proportional_floor "$total_delta" "$cumulative_seconds" "$elapsed"; cumulative_total="$PROPORTIONAL_RESULT"
+        segment_rx=$((cumulative_rx - allocated_rx)); segment_tx=$((cumulative_tx - allocated_tx))
+        segment_busy=$((cumulative_busy - allocated_busy)); segment_total=$((cumulative_total - allocated_total))
+
+        if [[ -n "$STATE_MONTH" && "$STATE_MONTH" != "$segment_month" ]]; then
+            archive_current_month
+            MONTH_RX=0; MONTH_TX=0; MONTH_CPU_BUSY=0; MONTH_CPU_TOTAL=0; MONTH_SECONDS=0
+        fi
+        STATE_MONTH="$segment_month"
+        MONTH_RX=$((MONTH_RX + segment_rx)); MONTH_TX=$((MONTH_TX + segment_tx))
+        MONTH_CPU_BUSY=$((MONTH_CPU_BUSY + segment_busy)); MONTH_CPU_TOTAL=$((MONTH_CPU_TOTAL + segment_total))
+        MONTH_SECONDS=$((MONTH_SECONDS + segment_seconds))
+
+        allocated_rx="$cumulative_rx"; allocated_tx="$cumulative_tx"
+        allocated_busy="$cumulative_busy"; allocated_total="$cumulative_total"
+        cursor="$segment_end"
+    done
 }
 
 prune_samples() {
@@ -388,19 +428,39 @@ run_report() {
     printf 'report: sent\n'
 }
 
+oldest_unsent_month() {
+    local current_month candidate month month_key current_key
+    local oldest="" oldest_key=0
+    current_month="$(date +%Y-%m)"; current_key="${current_month//-/}"
+    for candidate in "$DATA_DIR"/month-????-??.tsv; do
+        [[ -f "$candidate" ]] || continue
+        month="${candidate##*/month-}"; month="${month%.tsv}"
+        [[ "$month" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]] || continue
+        month_key="${month//-/}"
+        (( month_key < current_key )) || continue
+        [[ ! -e "${DATA_DIR}/sent-${month}" ]] || continue
+        if [[ -z "$oldest" ]] || (( month_key < oldest_key )); then
+            oldest="$month"; oldest_key="$month_key"
+        fi
+    done
+    [[ -n "$oldest" ]] || return 1
+    printf '%s' "$oldest"
+}
+
 run_monthly() {
     load_config; acquire_lock
     collect_locked >/dev/null
-    local previous_month archive marker rx tx busy total seconds message
-    previous_month="$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m)"
-    archive="${DATA_DIR}/month-${previous_month}.tsv"; marker="${DATA_DIR}/sent-${previous_month}"
-    [[ -r "$archive" ]] || { printf 'monthly: insufficient-data\n'; return; }
-    [[ ! -e "$marker" ]] || { printf 'monthly: duplicate-skipped\n'; return; }
+    local report_month archive marker rx tx busy total seconds message
+    if ! report_month="$(oldest_unsent_month)"; then
+        printf 'monthly: nothing-pending\n'
+        return
+    fi
+    archive="${DATA_DIR}/month-${report_month}.tsv"; marker="${DATA_DIR}/sent-${report_month}"
     read -r rx tx busy total seconds < "$archive"
     if ! is_uint "$rx" || ! is_uint "$tx" || ! is_uint "$busy" || ! is_uint "$total" || ! is_uint "$seconds"; then
         fatal "月度统计文件格式异常。"
     fi
-    message="$(format_month_message "$previous_month" "$rx" "$tx" "$busy" "$total")"
+    message="$(format_month_message "$report_month" "$rx" "$tx" "$busy" "$total")"
     send_message "$message"
     : > "$marker"; chmod 0600 "$marker"
     printf 'monthly: sent\n'
@@ -427,15 +487,29 @@ run_login_alert() {
 run_status() {
     require_root
     load_config; load_state
-    local last_sample="暂无" last_report="暂无" sample_count=0 state_size=0
-    local login_alert="异常" timers="正常" timer
+    local last_sample="暂无" last_report="暂无" sample_count=0 state_size=0 now
+    local login_alert="异常" timers="正常" timer service service_result
+    now="$(date +%s)"
     (( LAST_TS > 0 )) && last_sample="$(date -d "@${LAST_TS}" '+%F %T %Z')"
     (( LAST_REPORT > 0 )) && last_report="$(date -d "@${LAST_REPORT}" '+%F %T %Z')"
     [[ -r "$SAMPLES_FILE" ]] && sample_count="$(wc -l < "$SAMPLES_FILE")"
     [[ -r "$STATE_FILE" ]] && state_size="$(wc -c < "$STATE_FILE")"
     for timer in vps-monitor-{collect,report,monthly}.timer; do
-        systemctl is-enabled --quiet "$timer" && systemctl is-active --quiet "$timer" || timers="异常"
+        if ! systemctl is-enabled --quiet "$timer" || ! systemctl is-active --quiet "$timer"; then
+            timers="异常"
+        fi
     done
+    for service in vps-monitor-{collect,report,monthly}.service; do
+        if systemctl is-failed --quiet "$service"; then
+            timers="异常"
+        fi
+        service_result="$(systemctl show --property=Result --value "$service" 2>/dev/null || printf 'unknown')"
+        [[ -z "$service_result" || "$service_result" == success ]] || timers="异常"
+    done
+    if (( LAST_TS == 0 || LAST_TS > now + 300 || now - LAST_TS > MAX_SAMPLE_SECONDS )); then
+        timers="异常"
+    fi
+    monitored_interface_is_readable || timers="异常"
     if [[ -x "$LOGIN_HOOK_PATH" && -r "$PAM_SSHD_FILE" ]] \
         && grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE" && sshd_pam_is_enabled; then
         login_alert="正常"
@@ -715,7 +789,8 @@ verify_supported_os() {
     # shellcheck disable=SC1090 # The path is fixed in production and overridden only by tests.
     source "$os_release_file"
     case "${ID:-}:${VERSION_ID:-}" in
-        ubuntu:*) ;;
+        ubuntu:22.04|ubuntu:24.04) ;;
+        ubuntu:*) fatal "仅支持 Ubuntu 22.04/24.04，当前为 ${PRETTY_NAME:-未知系统}。" ;;
         debian:12|debian:12.*) ;;
         debian:*) fatal "仅支持 Debian 12，当前为 ${PRETTY_NAME:-未知系统}。" ;;
         *) fatal "仅支持 Ubuntu 和 Debian 12，当前为 ${PRETTY_NAME:-未知系统}。" ;;
@@ -923,7 +998,7 @@ EOF
 [Unit]
 Description=Send VPS monthly report
 [Timer]
-OnCalendar=*-*-01 00:05:00
+OnCalendar=*-*-* 00:05:00
 Persistent=true
 AccuracySec=1min
 Unit=vps-monitor-monthly.service
@@ -1022,6 +1097,11 @@ apply_installed_update() {
     WORK_DIR="$(mktemp -d -t vps-monitor-update-apply.XXXXXXXX)"
     chmod 0700 "$WORK_DIR"
     trap cleanup_work_dir EXIT
+    install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
+    chown root:"$SERVICE_USER" "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
+    chmod 0640 "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
     install_systemd_units
     install_login_alert_hook
     systemctl daemon-reload
@@ -1029,15 +1109,27 @@ apply_installed_update() {
 }
 
 restore_update_backup() {
-    local backup_dir="$1" unit
+    local backup_dir="$1" pam_line_was_present="$2" unit units_complete=1
     install -o root -g root -m 0755 "${backup_dir}/TG-check-notify.sh" "$SCRIPT_PATH" || return 1
-    install -o root -g root -m 0755 "${backup_dir}/login-alert-hook" "$LOGIN_HOOK_PATH" || return 1
+    if [[ -f "${backup_dir}/login-alert-hook" ]]; then
+        install -o root -g root -m 0755 "${backup_dir}/login-alert-hook" "$LOGIN_HOOK_PATH" || return 1
+    else
+        rm -f -- "$LOGIN_HOOK_PATH" || return 1
+    fi
     for unit in vps-monitor-{collect,report,monthly}.{service,timer}; do
-        install -o root -g root -m 0644 "${backup_dir}/units/${unit}" "${SYSTEMD_DIR}/${unit}" || return 1
+        if [[ -f "${backup_dir}/units/${unit}" ]]; then
+            install -o root -g root -m 0644 "${backup_dir}/units/${unit}" "${SYSTEMD_DIR}/${unit}" || return 1
+        else
+            rm -f -- "${SYSTEMD_DIR}/${unit}" || return 1
+            units_complete=0
+        fi
     done
+    (( pam_line_was_present == 1 )) || remove_pam_login_line || return 1
     ln -sfn "$SCRIPT_PATH" "$BIN_PATH" || return 1
     systemctl daemon-reload || return 1
-    systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null || return 1
+    if (( units_complete == 1 )); then
+        systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null || return 1
+    fi
 }
 
 run_update() {
@@ -1053,27 +1145,32 @@ run_update() {
     chmod 0700 "$WORK_DIR"
     trap cleanup_work_dir EXIT
     local downloaded="${WORK_DIR}/TG-check-notify.sh" backup_dir="${WORK_DIR}/backup"
-    local installed_version remote_version unit
+    local installed_version remote_version unit same_version=0 pam_line_was_present=0
 
     info "正在检查 GitHub 主版本并验证 SHA-256……"
     download_verified_main "$downloaded" || fatal "主版本下载或 SHA-256 校验失败，现有程序未被修改。"
     installed_version="$(script_version "$SCRIPT_PATH")" || fatal "无法识别当前安装版本，现有程序未被修改。"
     remote_version="$(script_version "$downloaded")" || fatal "无法识别主版本，现有程序未被修改。"
     if [[ "$remote_version" == "$installed_version" ]]; then
-        success "当前已经是最新版 v${installed_version}，配置和统计数据均未改动。"
-        return
+        same_version=1
+    else
+        version_is_newer "$remote_version" "$installed_version" \
+            || fatal "主版本 v${remote_version} 低于当前版本 v${installed_version}，已拒绝自动降级。"
     fi
-    version_is_newer "$remote_version" "$installed_version" \
-        || fatal "主版本 v${remote_version} 低于当前版本 v${installed_version}，已拒绝自动降级。"
 
     mkdir -p "${backup_dir}/units"
-    [[ -f "$LOGIN_HOOK_PATH" ]] || fatal "SSH 登录提醒组件不完整，现有程序未被修改。"
     cp -p -- "$SCRIPT_PATH" "${backup_dir}/TG-check-notify.sh"
-    cp -p -- "$LOGIN_HOOK_PATH" "${backup_dir}/login-alert-hook"
+    if [[ -f "$LOGIN_HOOK_PATH" ]]; then
+        cp -p -- "$LOGIN_HOOK_PATH" "${backup_dir}/login-alert-hook"
+    fi
     for unit in vps-monitor-{collect,report,monthly}.{service,timer}; do
-        [[ -f "${SYSTEMD_DIR}/${unit}" ]] || fatal "定时任务 ${unit} 不完整，现有程序未被修改。"
-        cp -p -- "${SYSTEMD_DIR}/${unit}" "${backup_dir}/units/${unit}"
+        if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
+            cp -p -- "${SYSTEMD_DIR}/${unit}" "${backup_dir}/units/${unit}"
+        fi
     done
+    if [[ -f "$PAM_SSHD_FILE" ]] && grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE"; then
+        pam_line_was_present=1
+    fi
 
     systemctl stop vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
     UPDATE_TIMERS_STOPPED=1
@@ -1091,22 +1188,31 @@ run_update() {
         sleep 1
     done
 
-    info "正在从 v${installed_version} 安全更新到 v${remote_version}……"
+    if (( same_version == 1 )); then
+        info "正在校验并修复 v${installed_version} 的完整安装……"
+    else
+        info "正在从 v${installed_version} 安全更新到 v${remote_version}……"
+    fi
     if install -o root -g root -m 0755 "$downloaded" "$SCRIPT_PATH" \
         && ln -sfn "$SCRIPT_PATH" "$BIN_PATH" \
         && "$SCRIPT_PATH" __apply-update; then
         UPDATE_TIMERS_STOPPED=0
-        success "更新完成：v${installed_version} → v${remote_version}。"
+        if (( same_version == 1 )); then
+            success "当前已是最新版 v${installed_version}，完整性检查和自动修复完成。"
+        else
+            success "更新完成：v${installed_version} → v${remote_version}。"
+        fi
         printf 'TG Token、UID、历史流量和 SSH 登录提醒均已保留。\n'
         return
     fi
 
     warn "新版本应用失败，正在恢复更新前的完整文件……"
-    if restore_update_backup "$backup_dir"; then
+    if restore_update_backup "$backup_dir" "$pam_line_was_present"; then
         UPDATE_TIMERS_STOPPED=0
-        fatal "更新失败，已自动恢复 v${installed_version}，配置和统计数据未丢失。"
+        fatal "更新或修复失败，已自动恢复 v${installed_version}，配置和统计数据未丢失。"
     fi
-    fatal "更新和自动恢复均未完整完成，请保留此输出并检查 systemd 状态；配置与统计目录未被删除。"
+    UPDATE_TIMERS_STOPPED=0
+    fatal "更新和自动恢复均未完整完成，定时任务已保持停止；请保留此输出并检查 systemd 状态，配置与统计目录未被删除。"
 }
 
 uninstall_app() {
