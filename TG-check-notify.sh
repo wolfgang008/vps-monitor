@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -22,6 +22,7 @@ SAMPLES_FILE="${DATA_DIR}/samples.tsv"
 LOCK_FILE="${DATA_DIR}/monitor.lock"
 UPDATE_LOCK_FILE="/run/lock/vps-monitor-update.lock"
 LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
+MANAGED_MARKER_PATH="${INSTALL_DIR}/.managed-by-vps-monitor"
 PAM_SSHD_FILE="${VPS_MONITOR_PAM_SSHD_FILE:-/etc/pam.d/sshd}"
 SSHD_BIN="${VPS_MONITOR_SSHD_BIN:-/usr/sbin/sshd}"
 PAM_MARKER="# vps-monitor SSH login alert"
@@ -30,10 +31,12 @@ GITHUB_BRANCH="main"
 GITHUB_ARCHIVE_URL="https://codeload.github.com/${GITHUB_REPOSITORY}/tar.gz/refs/heads/${GITHUB_BRANCH}"
 GITHUB_ARCHIVE_ROOT="${APP_NAME}-${GITHUB_BRANCH}"
 TELEGRAM_ROOT="https://api.telegram.org"
+BOOT_ID_FILE="${VPS_MONITOR_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 WINDOW_SECONDS=7200
 MIN_COVERAGE_SECONDS=6480
 MAX_SAMPLE_SECONDS=900
 SAMPLE_RETENTION_SECONDS=21600
+FORECAST_MIN_SECONDS=21600
 
 TOKEN=""
 CHAT_ID=""
@@ -56,12 +59,19 @@ STATE_WEEK=""
 WEEK_RX=0
 WEEK_TX=0
 WEEK_SECONDS=0
+PREVIOUS_BOOT_LAST_TS=0
+BOOT_ALERTED=""
 LAST_REPORT=0
 WORK_DIR=""
 UPDATE_TIMERS_STOPPED=0
 APPLY_UPDATE_IN_PROGRESS=0
 APPLY_UPDATE_WEEKLY_SERVICE_EXISTED=0
 APPLY_UPDATE_WEEKLY_TIMER_EXISTED=0
+APPLY_UPDATE_BOOT_SERVICE_EXISTED=0
+APPLY_UPDATE_MANAGED_MARKER_EXISTED=0
+INSTALL_IN_PROGRESS=0
+INSTALL_CREATED_SERVICE_ACCOUNT=0
+INSTALL_CREATED_SERVICE_GROUP=0
 PROPORTIONAL_RESULT=0
 
 if [[ -t 1 ]]; then
@@ -88,16 +98,43 @@ is_server_name() {
 cleanup_failed_apply_units() {
     systemctl disable --now vps-monitor-weekly.timer >/dev/null 2>&1 || true
     systemctl stop vps-monitor-weekly.service >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-boot.service >/dev/null 2>&1 || true
     if (( APPLY_UPDATE_WEEKLY_SERVICE_EXISTED == 0 )); then
         rm -f -- "${SYSTEMD_DIR}/vps-monitor-weekly.service" || true
     fi
     if (( APPLY_UPDATE_WEEKLY_TIMER_EXISTED == 0 )); then
         rm -f -- "${SYSTEMD_DIR}/vps-monitor-weekly.timer" || true
     fi
+    if (( APPLY_UPDATE_BOOT_SERVICE_EXISTED == 0 )); then
+        rm -f -- "${SYSTEMD_DIR}/vps-monitor-boot.service" || true
+    fi
+    if (( APPLY_UPDATE_MANAGED_MARKER_EXISTED == 0 )); then
+        rm -f -- "$MANAGED_MARKER_PATH" || true
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+cleanup_failed_install() {
+    systemctl disable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-boot.service >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot}.service >/dev/null 2>&1 || true
+    remove_pam_login_line >/dev/null 2>&1 || true
+    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer} \
+        "${SYSTEMD_DIR}/vps-monitor-boot.service" "$BIN_PATH" "$UPDATE_LOCK_FILE" || true
+    rm -rf -- "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" || true
+    if (( INSTALL_CREATED_SERVICE_ACCOUNT == 1 )); then
+        userdel "$SERVICE_USER" >/dev/null 2>&1 || true
+    fi
+    if (( INSTALL_CREATED_SERVICE_GROUP == 1 )); then
+        groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 cleanup_work_dir() {
+    if (( INSTALL_IN_PROGRESS == 1 )) && (( EUID == 0 )) && command -v systemctl >/dev/null; then
+        cleanup_failed_install
+    fi
     if (( APPLY_UPDATE_IN_PROGRESS == 1 )) && (( EUID == 0 )) && command -v systemctl >/dev/null; then
         cleanup_failed_apply_units
     fi
@@ -127,6 +164,7 @@ reset_state_defaults() {
     LAST_CPU_BUSY=0; LAST_CPU_TOTAL=0; STATE_MONTH=""
     MONTH_RX=0; MONTH_TX=0; MONTH_CPU_BUSY=0; MONTH_CPU_TOTAL=0
     MONTH_SECONDS=0; STATE_WEEK=""; WEEK_RX=0; WEEK_TX=0; WEEK_SECONDS=0
+    PREVIOUS_BOOT_LAST_TS=0; BOOT_ALERTED=""
     LAST_REPORT=0
 }
 
@@ -153,6 +191,8 @@ load_state() {
             week_rx) is_uint "$value" && WEEK_RX="$value" ;;
             week_tx) is_uint "$value" && WEEK_TX="$value" ;;
             week_seconds) is_uint "$value" && WEEK_SECONDS="$value" ;;
+            previous_boot_last_ts) is_uint "$value" && PREVIOUS_BOOT_LAST_TS="$value" ;;
+            boot_alerted) [[ "$value" =~ ^[A-Fa-f0-9-]{16,64}$ ]] && BOOT_ALERTED="$value" ;;
             last_report) is_uint "$value" && LAST_REPORT="$value" ;;
         esac
     done < "$STATE_FILE"
@@ -179,6 +219,8 @@ save_state() {
         week_rx "$WEEK_RX" \
         week_tx "$WEEK_TX" \
         week_seconds "$WEEK_SECONDS" \
+        previous_boot_last_ts "$PREVIOUS_BOOT_LAST_TS" \
+        boot_alerted "$BOOT_ALERTED" \
         last_report "$LAST_REPORT" > "$temporary"
     chmod 0600 "$temporary"
     mv -f -- "$temporary" "$STATE_FILE"
@@ -195,13 +237,14 @@ read_counters() {
     local rx_path="/sys/class/net/${INTERFACE}/statistics/rx_bytes"
     local tx_path="/sys/class/net/${INTERFACE}/statistics/tx_bytes"
     monitored_interface_is_readable || fatal "无法读取网卡 ${INTERFACE}，请重新安装以自动识别网卡。"
+    [[ -r /proc/stat && -r "$BOOT_ID_FILE" ]] || fatal "系统统计接口或启动标识不可读。"
     CURRENT_RX="$(<"$rx_path")"
     CURRENT_TX="$(<"$tx_path")"
     read -r cpu_label user nice system idle iowait irq softirq steal _ < /proc/stat
     [[ "$cpu_label" == "cpu" ]] || fatal "无法读取 /proc/stat。"
     CURRENT_CPU_BUSY=$((user + nice + system + irq + softirq + steal))
     CURRENT_CPU_TOTAL=$((CURRENT_CPU_BUSY + idle + iowait))
-    CURRENT_BOOT="$(< /proc/sys/kernel/random/boot_id)"
+    CURRENT_BOOT="$(<"$BOOT_ID_FILE")"
     CURRENT_TS="$(date +%s)"
     if ! is_uint "$CURRENT_RX" || ! is_uint "$CURRENT_TX"; then
         fatal "网卡计数器格式异常。"
@@ -210,6 +253,7 @@ read_counters() {
 
 archive_current_month() {
     [[ "$STATE_MONTH" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]] || return 0
+    (( MONTH_SECONDS > 0 )) || return 0
     local archive="${DATA_DIR}/month-${STATE_MONTH}.tsv"
     local temporary
     temporary="$(mktemp "${DATA_DIR}/month.XXXXXXXX")"
@@ -261,8 +305,11 @@ proportional_floor() {
 
 add_month_delta() {
     local current_month="$1" elapsed="$2" rx_delta="$3" tx_delta="$4" busy_delta="$5" total_delta="$6"
-    if [[ -z "$STATE_MONTH" || "$STATE_MONTH" == "$current_month" ]]; then
-        STATE_MONTH="$current_month"
+    if [[ -z "$STATE_MONTH" ]]; then
+        STATE_MONTH="$(date -d "@${LAST_TS}" +%Y-%m)" || fatal "无法初始化月度统计月份。"
+        [[ "$STATE_MONTH" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]] || fatal "月度统计初始月份异常。"
+    fi
+    if [[ "$STATE_MONTH" == "$current_month" ]]; then
         MONTH_RX=$((MONTH_RX + rx_delta)); MONTH_TX=$((MONTH_TX + tx_delta))
         MONTH_CPU_BUSY=$((MONTH_CPU_BUSY + busy_delta)); MONTH_CPU_TOTAL=$((MONTH_CPU_TOTAL + total_delta))
         MONTH_SECONDS=$((MONTH_SECONDS + elapsed))
@@ -382,6 +429,11 @@ collect_locked() {
     is_week_key "$current_week" || fatal "无法计算当前统计周次。"
 
     if (( LAST_TS == 0 )) || [[ "$LAST_BOOT" != "$CURRENT_BOOT" || "$LAST_INTERFACE" != "$INTERFACE" ]]; then
+        if (( LAST_TS == 0 )); then
+            BOOT_ALERTED="$CURRENT_BOOT"
+        elif [[ -n "$LAST_BOOT" && "$LAST_BOOT" != "$CURRENT_BOOT" ]]; then
+            PREVIOUS_BOOT_LAST_TS="$LAST_TS"
+        fi
         roll_month_without_delta "$current_month"
         roll_week_without_delta "$current_week"
         LAST_TS="$CURRENT_TS"; LAST_BOOT="$CURRENT_BOOT"; LAST_INTERFACE="$INTERFACE"
@@ -426,8 +478,8 @@ collect_locked() {
 acquire_lock() {
     exec 9>"$LOCK_FILE"
     if ! flock -w 30 9; then
-        warn "另一个监控任务仍在运行，本次操作已安全跳过。"
-        exit 0
+        warn "另一个监控任务仍在运行，暂时无法取得统计锁。"
+        return 1
     fi
 }
 
@@ -452,12 +504,14 @@ calculate_window() {
 }
 
 format_two_hour_message() {
-    local rx="$1" tx="$2" busy="$3" total="$4" month_total="$5"
-    awk -v name="$SERVER_NAME" -v rx="$rx" -v tx="$tx" -v busy="$busy" -v total="$total" -v month_total="$month_total" '
+    local rx="$1" tx="$2" busy="$3" total="$4" coverage="$5" month_total="$6" forecast="${7:-}"
+    awk -v name="$SERVER_NAME" -v rx="$rx" -v tx="$tx" -v busy="$busy" -v total="$total" \
+        -v coverage="$coverage" -v month_total="$month_total" -v forecast="$forecast" '
         BEGIN {
             cpu=(total>0 ? busy*100/total : 0)
             printf "%s\n进站速度: %.2f MB/s\n出站速度: %.2f MB/s\n总流量: %.2f TB\nCPU利用率: %.0f%%", \
-                name, rx/7200/1000000, tx/7200/1000000, month_total/1000000000000, cpu
+                name, rx/coverage/1000000, tx/coverage/1000000, month_total/1000000000000, cpu
+            if (forecast != "") printf "\n月底预计总流量: %.2f TB", forecast/1000000000000
         }
     '
 }
@@ -473,14 +527,89 @@ format_month_message() {
     '
 }
 
+calculate_month_forecast() {
+    local now="$1" month_total="$2" observed_seconds="$3" current_month next_month month_end remaining
+    if ! is_uint "$now" || ! is_uint "$month_total" || ! is_uint "$observed_seconds" \
+        || (( observed_seconds < FORECAST_MIN_SECONDS )); then
+        return 1
+    fi
+    current_month="$(date -d "@${now}" +%Y-%m)" || return 1
+    next_month="$(date -d "${current_month}-01 +1 month" +%Y-%m)" || return 1
+    month_end="$(date -d "${next_month}-01 00:00:00" +%s)" || return 1
+    is_uint "$month_end" && (( month_end > now )) || return 1
+    remaining=$((month_end - now))
+    awk -v total="$month_total" -v observed="$observed_seconds" -v remaining="$remaining" '
+        BEGIN { printf "%.0f", total + total * remaining / observed }
+    '
+}
+
+previous_week_key() {
+    local week="$1" year number jan4 weekday week_one_monday offset previous
+    is_week_key "$week" || return 1
+    year="${week%%-*}"; number="${week##*W}"
+    jan4="${year}-01-04"
+    weekday="$(date -d "$jan4" +%u)" || return 1
+    [[ "$weekday" =~ ^[1-7]$ ]] || return 1
+    week_one_monday="$(date -d "$jan4 -$((10#$weekday - 1)) days" +%F)" || return 1
+    offset=$(((10#$number - 2) * 7))
+    previous="$(date -d "$week_one_monday ${offset} days" +%G-W%V)" || return 1
+    is_week_key "$previous" || return 1
+    printf '%s' "$previous"
+}
+
+calculate_week_trend() {
+    local report_week="$1" rx="$2" tx="$3" previous_week archive
+    local previous_rx previous_tx previous_seconds current_total previous_total
+    previous_week="$(previous_week_key "$report_week")" || return 1
+    archive="${DATA_DIR}/week-${previous_week}.tsv"
+    [[ -r "$archive" ]] || return 1
+    read -r previous_rx previous_tx previous_seconds < "$archive"
+    is_uint "$previous_rx" && is_uint "$previous_tx" && is_uint "$previous_seconds" \
+        && (( previous_seconds > 0 )) || return 1
+    current_total=$((rx + tx)); previous_total=$((previous_rx + previous_tx))
+    if (( previous_total == 0 )); then
+        (( current_total == 0 )) && printf '0.0%%' || printf '新增流量'
+        return
+    fi
+    awk -v current="$current_total" -v previous="$previous_total" '
+        BEGIN { printf "%+.1f%%", (current - previous) * 100 / previous }
+    '
+}
+
 format_week_message() {
-    local rx="$1" tx="$2"
-    awk -v name="$SERVER_NAME" -v rx="$rx" -v tx="$tx" '
+    local rx="$1" tx="$2" trend="${3:-}"
+    awk -v name="$SERVER_NAME" -v rx="$rx" -v tx="$tx" -v trend="$trend" '
         BEGIN {
             printf "%s\n上一周的流量使用情况为：\n进站流量: %.2f TB\n出站流量: %.2f TB\n总流量: %.2f TB", \
                 name, rx/1000000000000, tx/1000000000000, (rx+tx)/1000000000000
+            if (trend != "") printf "\n较前一周: %s", trend
         }
     '
+}
+
+format_duration() {
+    local seconds="$1" days hours minutes
+    is_uint "$seconds" || { printf '未知'; return; }
+    days=$((seconds / 86400)); hours=$((seconds % 86400 / 3600)); minutes=$((seconds % 3600 / 60))
+    if (( days > 0 )); then
+        printf '%d 天 %d 小时' "$days" "$hours"
+    elif (( hours > 0 )); then
+        printf '%d 小时 %d 分钟' "$hours" "$minutes"
+    elif (( minutes > 0 )); then
+        printf '%d 分钟' "$minutes"
+    else
+        printf '不足 1 分钟'
+    fi
+}
+
+format_boot_message() {
+    local previous_epoch="$1" now="$2" previous_time="未知" offline="未知"
+    if is_uint "$previous_epoch" && (( previous_epoch > 0 && previous_epoch <= now )); then
+        previous_time="$(date -d "@${previous_epoch}" '+%F %T %Z')"
+        offline="$(format_duration "$((now - previous_epoch))")"
+    fi
+    printf '🔄 VPS 启动提醒\n服务器: %s\n状态: 已启动并恢复监控\n上次采样: %s\n预计离线: %s' \
+        "$SERVER_NAME" "$previous_time" "$offline"
 }
 
 format_login_message() {
@@ -526,15 +655,20 @@ send_message() {
 }
 
 run_collect() {
-    load_config; acquire_lock
+    load_config
+    if ! acquire_lock; then
+        printf 'collect: lock-busy-skipped\n'
+        return
+    fi
     collect_locked
 }
 
 run_report() {
-    load_config; acquire_lock
+    load_config
+    acquire_lock || fatal "统计任务繁忙，本次两小时汇报将由 systemd 自动重试。"
     collect_locked >/dev/null
     load_state
-    local now rx tx busy total coverage message
+    local now rx tx busy total coverage message month_total forecast=""
     now="$(date +%s)"
     if (( LAST_REPORT > 0 && now - LAST_REPORT < 6480 )); then
         printf 'report: duplicate-skipped\n'
@@ -545,7 +679,9 @@ run_report() {
         printf 'report: insufficient-data\n'
         return
     fi
-    message="$(format_two_hour_message "$rx" "$tx" "$busy" "$total" "$((MONTH_RX + MONTH_TX))")"
+    month_total=$((MONTH_RX + MONTH_TX))
+    forecast="$(calculate_month_forecast "$now" "$month_total" "$MONTH_SECONDS" || true)"
+    message="$(format_two_hour_message "$rx" "$tx" "$busy" "$total" "$coverage" "$month_total" "$forecast")"
     send_message "$message"
     LAST_REPORT="$now"; save_state
     printf 'report: sent\n'
@@ -590,7 +726,8 @@ oldest_unsent_week() {
 }
 
 run_monthly() {
-    load_config; acquire_lock
+    load_config
+    acquire_lock || fatal "统计任务繁忙，本次月报将由 systemd 自动重试。"
     collect_locked >/dev/null
     local report_month archive marker rx tx busy total seconds message
     if ! report_month="$(oldest_unsent_month)"; then
@@ -609,9 +746,10 @@ run_monthly() {
 }
 
 run_weekly() {
-    load_config; acquire_lock
+    load_config
+    acquire_lock || fatal "统计任务繁忙，本次周报将由 systemd 自动重试。"
     collect_locked >/dev/null
-    local report_week archive marker rx tx seconds message
+    local report_week archive marker rx tx seconds message trend=""
     if ! report_week="$(oldest_unsent_week)"; then
         printf 'weekly: nothing-pending\n'
         return
@@ -621,7 +759,8 @@ run_weekly() {
     if ! is_uint "$rx" || ! is_uint "$tx" || ! is_uint "$seconds" || (( seconds == 0 )); then
         fatal "周度统计文件格式异常。"
     fi
-    message="$(format_week_message "$rx" "$tx")"
+    trend="$(calculate_week_trend "$report_week" "$rx" "$tx" || true)"
+    message="$(format_week_message "$rx" "$tx" "$trend")"
     send_message "$message"
     : > "$marker"; chmod 0600 "$marker"
     printf 'weekly: sent\n'
@@ -631,6 +770,50 @@ run_test_message() {
     load_config
     send_message "${SERVER_NAME}"$'\n监控测试成功。'
     printf 'test: sent\n'
+}
+
+initialize_boot_alert_state() {
+    load_config
+    acquire_lock || fatal "统计任务繁忙，无法初始化开机提醒状态。"
+    load_state
+    local current_boot
+    current_boot="$(<"$BOOT_ID_FILE")"
+    [[ "$current_boot" =~ ^[A-Fa-f0-9-]{16,64}$ ]] || fatal "无法读取系统启动标识。"
+    BOOT_ALERTED="$current_boot"
+    save_state
+}
+
+run_boot_alert() {
+    load_config
+    acquire_lock || fatal "统计任务繁忙，开机提醒将由 systemd 自动重试。"
+    load_state
+    local current_boot now previous_epoch message
+    current_boot="$(<"$BOOT_ID_FILE")"; now="$(date +%s)"
+    [[ "$current_boot" =~ ^[A-Fa-f0-9-]{16,64}$ ]] || fatal "无法读取系统启动标识。"
+    if [[ "$BOOT_ALERTED" == "$current_boot" ]]; then
+        printf 'boot-alert: duplicate-skipped\n'
+        return
+    fi
+    if [[ "$LAST_BOOT" == "$current_boot" ]]; then
+        previous_epoch="$PREVIOUS_BOOT_LAST_TS"
+    else
+        previous_epoch="$LAST_TS"
+    fi
+    if ! is_uint "$previous_epoch" || (( previous_epoch == 0 )); then
+        BOOT_ALERTED="$current_boot"; save_state
+        printf 'boot-alert: no-previous-sample\n'
+        return
+    fi
+    message="$(format_boot_message "$previous_epoch" "$now")"
+    send_message "$message"
+    BOOT_ALERTED="$current_boot"; save_state
+    printf 'boot-alert: sent\n'
+}
+
+run_doctor_message() {
+    load_config
+    send_message "${SERVER_NAME}"$'\n✅ VPS Monitor 自检与一键修复完成，所有可自动修复项目均已恢复正常。'
+    printf 'doctor-notify: sent\n'
 }
 
 run_login_alert() {
@@ -649,8 +832,11 @@ run_status() {
     require_root
     load_config; load_state
     local last_sample="暂无" last_report="暂无" sample_count=0 state_size=0 now
-    local login_alert="异常" timers="正常" timer service service_result
+    local login_alert="异常" boot_alert="正常" timers="正常" timer service service_result
+    local month_total week_total forecast="数据不足" current_month current_week candidate key
+    local pending_months=0 pending_weeks=0 timezone
     now="$(date +%s)"
+    current_month="$(date +%Y-%m)"; current_week="$(date +%G-W%V)"; timezone="$(date +%Z)"
     (( LAST_TS > 0 )) && last_sample="$(date -d "@${LAST_TS}" '+%F %T %Z')"
     (( LAST_REPORT > 0 )) && last_report="$(date -d "@${LAST_REPORT}" '+%F %T %Z')"
     [[ -r "$SAMPLES_FILE" ]] && sample_count="$(wc -l < "$SAMPLES_FILE")"
@@ -667,6 +853,10 @@ run_status() {
         service_result="$(systemctl show --property=Result --value "$service" 2>/dev/null || printf 'unknown')"
         [[ -z "$service_result" || "$service_result" == success ]] || timers="异常"
     done
+    if ! systemctl is-enabled --quiet vps-monitor-boot.service \
+        || systemctl is-failed --quiet vps-monitor-boot.service; then
+        boot_alert="异常"
+    fi
     if (( LAST_TS == 0 || LAST_TS > now + 300 || now - LAST_TS > MAX_SAMPLE_SECONDS )); then
         timers="异常"
     fi
@@ -675,8 +865,27 @@ run_status() {
         && grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE" && sshd_pam_is_enabled; then
         login_alert="正常"
     fi
-    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n定时任务: %s\n登录提醒: %s\n最近采样: %s\n最近汇报: %s\n短期样本: %s 条\n状态文件: %s 字节\n' \
-        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$timers" "$login_alert" "$last_sample" "$last_report" "$sample_count" "$state_size"
+    month_total=$((MONTH_RX + MONTH_TX)); week_total=$((WEEK_RX + WEEK_TX))
+    forecast="$(calculate_month_forecast "$now" "$month_total" "$MONTH_SECONDS" 2>/dev/null || printf '数据不足')"
+    [[ "$forecast" == "数据不足" ]] || forecast="$(awk -v value="$forecast" 'BEGIN { printf "%.2f TB", value/1000000000000 }')"
+    for candidate in "$DATA_DIR"/month-????-??.tsv; do
+        [[ -f "$candidate" ]] || continue
+        key="${candidate##*/month-}"; key="${key%.tsv}"
+        [[ "$key" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]] || continue
+        [[ "$key" < "$current_month" && ! -e "${DATA_DIR}/sent-${key}" ]] && pending_months=$((pending_months + 1))
+    done
+    for candidate in "$DATA_DIR"/week-????-W??.tsv; do
+        [[ -f "$candidate" ]] || continue
+        key="${candidate##*/week-}"; key="${key%.tsv}"
+        is_week_key "$key" || continue
+        [[ "$key" < "$current_week" && ! -e "${DATA_DIR}/sent-week-${key}" ]] && pending_weeks=$((pending_weeks + 1))
+    done
+    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n本地时区: %s\n定时任务: %s\n登录提醒: %s\n开机提醒: %s\n最近采样: %s\n最近汇报: %s\n本周流量: %.2f TB\n本月流量: %.2f TB\n月底预计: %s\n待发周报: %s 条\n待发月报: %s 条\n短期样本: %s 条\n状态文件: %s 字节\n' \
+        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$timezone" "$timers" "$login_alert" "$boot_alert" \
+        "$last_sample" "$last_report" \
+        "$(awk -v value="$week_total" 'BEGIN { printf "%.2f", value/1000000000000 }')" \
+        "$(awk -v value="$month_total" 'BEGIN { printf "%.2f", value/1000000000000 }')" \
+        "$forecast" "$pending_weeks" "$pending_months" "$sample_count" "$state_size"
 }
 
 setup_api_call() {
@@ -848,23 +1057,40 @@ EOF
 }
 
 ensure_pam_login_line() {
-    local line
+    local line temporary
     line="$(pam_login_line)"
     grep -Fqx "$line" "$PAM_SSHD_FILE" && return 0
-    printf '\n%s\n%s\n' "$PAM_MARKER" "$line" >> "$PAM_SSHD_FILE"
+    temporary="$(mktemp "${PAM_SSHD_FILE}.vps-monitor.XXXXXXXX")"
+    if ! awk -v marker="$PAM_MARKER" -v line="$line" '
+            $0 != marker && $0 != line { print }
+            END { print ""; print marker; print line }
+        ' "$PAM_SSHD_FILE" > "$temporary" \
+        || ! chown --reference="$PAM_SSHD_FILE" "$temporary" \
+        || ! chmod --reference="$PAM_SSHD_FILE" "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if command -v chcon >/dev/null 2>&1; then
+        chcon --reference="$PAM_SSHD_FILE" "$temporary" >/dev/null 2>&1 || true
+    fi
+    mv -f -- "$temporary" "$PAM_SSHD_FILE"
 }
 
 remove_pam_login_line() {
     [[ -f "$PAM_SSHD_FILE" ]] || return 0
     local line temporary
-    line="$(pam_login_line)"; temporary="$(mktemp -t vps-monitor-pam.XXXXXXXX)"
+    line="$(pam_login_line)"; temporary="$(mktemp "${PAM_SSHD_FILE}.vps-monitor.XXXXXXXX")"
     if ! awk -v marker="$PAM_MARKER" -v line="$line" '$0 != marker && $0 != line' \
-        "$PAM_SSHD_FILE" > "$temporary"; then
+            "$PAM_SSHD_FILE" > "$temporary" \
+        || ! chown --reference="$PAM_SSHD_FILE" "$temporary" \
+        || ! chmod --reference="$PAM_SSHD_FILE" "$temporary"; then
         rm -f -- "$temporary"
         return 1
     fi
-    cat -- "$temporary" > "$PAM_SSHD_FILE"
-    rm -f -- "$temporary"
+    if command -v chcon >/dev/null 2>&1; then
+        chcon --reference="$PAM_SSHD_FILE" "$temporary" >/dev/null 2>&1 || true
+    fi
+    mv -f -- "$temporary" "$PAM_SSHD_FILE"
 }
 
 install_login_alert_hook() {
@@ -926,7 +1152,7 @@ is_managed_service_account() {
     IFS=: read -r account_name _ account_uid account_gid _ account_home account_shell <<< "$passwd_entry"
     IFS=: read -r group_name _ group_gid _ <<< "$group_entry"
     is_uint "$account_uid" && is_uint "$account_gid" && is_uint "$group_gid" \
-        && (( account_uid > 0 && account_uid < 1000 )) \
+        && (( account_uid > 0 )) \
         && [[ "$account_name" == "$SERVICE_USER" && "$group_name" == "$SERVICE_USER" ]] \
         && [[ "$account_gid" == "$group_gid" && "$account_home" == "$DATA_DIR" ]] \
         && [[ "$account_shell" == /usr/sbin/nologin || "$account_shell" == /bin/false ]]
@@ -1196,7 +1422,78 @@ Unit=vps-monitor-monthly.service
 [Install]
 WantedBy=timers.target
 EOF
+    cat > "${SYSTEMD_DIR}/vps-monitor-boot.service" <<EOF
+[Unit]
+Description=Notify when the VPS has booted and monitoring has recovered
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+ExecStart=${BIN_PATH} boot-alert
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=${DATA_DIR}
+TimeoutStartSec=4min
+Restart=on-failure
+RestartSec=5min
+[Install]
+WantedBy=multi-user.target
+EOF
     chmod 0644 "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer}
+    chmod 0644 "${SYSTEMD_DIR}/vps-monitor-boot.service"
+}
+
+installed_script_is_managed() {
+    [[ -f "$SCRIPT_PATH" ]] && grep -q '^# VPS_TELEGRAM_MONITOR_SCRIPT=1$' "$SCRIPT_PATH"
+}
+
+ensure_bin_link() {
+    if [[ -e "$BIN_PATH" || -L "$BIN_PATH" ]]; then
+        [[ -L "$BIN_PATH" && "$(readlink "$BIN_PATH")" == "$SCRIPT_PATH" ]] \
+            || fatal "${BIN_PATH} 已被其他程序占用，为避免覆盖原有文件，操作已停止。"
+    fi
+    ln -sfn "$SCRIPT_PATH" "$BIN_PATH"
+}
+
+assert_fresh_install_targets() {
+    local unit
+    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer} vps-monitor-boot.service; do
+        [[ ! -e "${SYSTEMD_DIR}/${unit}" && ! -L "${SYSTEMD_DIR}/${unit}" ]] \
+            || fatal "检测到同名 systemd 单元 ${unit}，为避免影响原有服务，安装已停止。"
+    done
+    for unit in "$BIN_PATH" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"; do
+        [[ ! -e "$unit" && ! -L "$unit" ]] \
+            || fatal "检测到残留或同名路径 ${unit}。请先确认来源，程序不会自动覆盖。"
+    done
+    if getent passwd "$SERVICE_USER" >/dev/null || getent group "$SERVICE_USER" >/dev/null; then
+        fatal "系统中已存在 vpsmonitor 用户或用户组。为避免影响原有服务，安装已停止。"
+    fi
+    if [[ -f "$PAM_SSHD_FILE" ]] \
+        && { grep -Fqx "$PAM_MARKER" "$PAM_SSHD_FILE" || grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE"; }; then
+        fatal "检测到旧的 VPS Monitor PAM 残留。请先执行远程一键卸载命令后再安装。"
+    fi
+}
+
+install_managed_marker() {
+    local marker="${WORK_DIR}/managed-marker"
+    printf 'VPS_TELEGRAM_MONITOR_SCRIPT=1\n' > "$marker"
+    install -o root -g root -m 0644 "$marker" "$MANAGED_MARKER_PATH"
 }
 
 install_script_source() {
@@ -1212,21 +1509,27 @@ install_script_source() {
     bash -n "$temporary" || fatal "脚本语法校验失败。"
     install -d -o root -g root -m 0755 "$INSTALL_DIR"
     install -o root -g root -m 0755 "$temporary" "$SCRIPT_PATH"
-    ln -sfn "$SCRIPT_PATH" "$BIN_PATH"
+    ensure_bin_link
+    install_managed_marker
 }
 
 install_app() {
     require_root
-    if [[ -f "$SCRIPT_PATH" && -x "$SCRIPT_PATH" && -e "$BIN_PATH" \
-        && -r "$TOKEN_FILE" && -r "$CHAT_ID_FILE" && -r "$SERVER_NAME_FILE" && -r "$INTERFACE_FILE" ]]; then
+    if installed_script_is_managed \
+        && [[ -r "$TOKEN_FILE" && -r "$CHAT_ID_FILE" && -r "$SERVER_NAME_FILE" && -r "$INTERFACE_FILE" ]]; then
         info "检测到现有安装，将保留 TG 配置和统计数据并执行安全更新。"
         run_update
         return
     fi
     verify_supported_os; ensure_dependencies
+    assert_fresh_install_targets
+    sshd_pam_is_enabled \
+        || fatal "SSH 未启用 PAM 会话处理（UsePAM yes），无法保证登录提醒生效，安装未修改系统。"
+    [[ -f "$PAM_SSHD_FILE" && -w "$PAM_SSHD_FILE" ]] \
+        || fatal "找不到可写的 SSH PAM 配置，安装未修改系统。"
     has_interactive_terminal || fatal "需要交互式 SSH 终端，当前环境无法安全读取安装信息。"
     WORK_DIR="$(mktemp -d -t vps-monitor-install.XXXXXXXX)"; chmod 0700 "$WORK_DIR"; trap cleanup_work_dir EXIT
-    local setup_token setup_chat_id setup_interface setup_server_name create_service_account=0
+    local setup_token setup_chat_id setup_interface setup_server_name
     printf '\n╭────────────────────────────────────╮\n│  VPS Telegram Monitor 一键安装    │\n╰────────────────────────────────────╯\n\n' > /dev/tty
     setup_server_name="$(prompt_server_name)"
     read -r -s -p '请输入 Bot Token（输入不会显示）：' setup_token < /dev/tty
@@ -1237,27 +1540,15 @@ install_app() {
     setup_interface="$(detect_interface)"
     success "服务器名称：${setup_server_name}；监控网卡：${setup_interface}"
 
-    if getent passwd "$SERVICE_USER" >/dev/null; then
-        is_managed_service_account \
-            || fatal "系统中已存在同名账户，但属性不属于本程序。为避免影响原有服务，安装已停止。"
-    else
-        ! getent group "$SERVICE_USER" >/dev/null \
-            || fatal "系统中已存在同名用户组。为避免影响原有服务，安装已停止。"
-        create_service_account=1
-    fi
+    INSTALL_IN_PROGRESS=1
     install_script_source
-    if (( create_service_account == 1 )); then
-        if ! groupadd --system "$SERVICE_USER"; then
-            rm -f -- "$BIN_PATH"; rm -rf -- "$INSTALL_DIR"
-            fatal "无法创建专用系统用户组，安装已安全停止。"
-        fi
-        if ! useradd --system --gid "$SERVICE_USER" --home-dir "$DATA_DIR" \
-            --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"; then
-            groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
-            rm -f -- "$BIN_PATH"; rm -rf -- "$INSTALL_DIR"
-            fatal "无法创建专用系统账户，安装已安全停止。"
-        fi
+    groupadd --system "$SERVICE_USER" || fatal "无法创建专用系统用户组，安装将自动回滚。"
+    INSTALL_CREATED_SERVICE_GROUP=1
+    if ! useradd --system --gid "$SERVICE_USER" --home-dir "$DATA_DIR" \
+        --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"; then
+        fatal "无法创建专用系统账户，安装将自动回滚。"
     fi
+    INSTALL_CREATED_SERVICE_ACCOUNT=1
     systemctl stop vps-monitor-{collect,report,weekly,monthly}.{timer,service} >/dev/null 2>&1 || true
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
@@ -1269,15 +1560,18 @@ install_app() {
     install -o root -g "$SERVICE_USER" -m 0640 "${WORK_DIR}/chat_id" "$CHAT_ID_FILE"
     install -o root -g "$SERVICE_USER" -m 0640 "${WORK_DIR}/server_name" "$SERVER_NAME_FILE"
     install -o root -g "$SERVICE_USER" -m 0640 "${WORK_DIR}/interface" "$INTERFACE_FILE"
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
+    chown -hR -- "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
 
     install_systemd_units
     install_login_alert_hook
     systemctl daemon-reload
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
+    runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
     systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null
+    systemctl enable vps-monitor-boot.service >/dev/null
+    INSTALL_IN_PROGRESS=0
     success "安装完成，Telegram 安全启动链接与 SSH 登录提醒已验证"
-    printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每周一中午发送周报，每月 1 日发送月报；SSH 登录成功时立即提醒。\n'
+    printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报并预测月底流量，每周一发送带环比的周报，每月发送月报；VPS 重启恢复和 SSH 登录成功时立即提醒。\n'
     printf '查看状态：sudo vps-monitor status\n查看日志：sudo journalctl -u "vps-monitor-*" --since today\n\n'
     warn "Token 与 UID 仅保存在受限配置文件中，日志不会输出这些信息。"
 }
@@ -1291,16 +1585,22 @@ apply_installed_update() {
     trap cleanup_work_dir EXIT
     [[ -e "${SYSTEMD_DIR}/vps-monitor-weekly.service" ]] && APPLY_UPDATE_WEEKLY_SERVICE_EXISTED=1
     [[ -e "${SYSTEMD_DIR}/vps-monitor-weekly.timer" ]] && APPLY_UPDATE_WEEKLY_TIMER_EXISTED=1
+    [[ -e "${SYSTEMD_DIR}/vps-monitor-boot.service" ]] && APPLY_UPDATE_BOOT_SERVICE_EXISTED=1
+    [[ -e "$MANAGED_MARKER_PATH" ]] && APPLY_UPDATE_MANAGED_MARKER_EXISTED=1
     APPLY_UPDATE_IN_PROGRESS=1
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
     chown root:"$SERVICE_USER" "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
     chmod 0640 "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
+    chown -hR -- "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
+    ensure_bin_link
+    install_managed_marker
     install_systemd_units
     install_login_alert_hook
     systemctl daemon-reload
+    runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
     systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null
+    systemctl enable vps-monitor-boot.service >/dev/null
     APPLY_UPDATE_IN_PROGRESS=0
 }
 
@@ -1313,7 +1613,7 @@ restore_update_backup() {
     else
         rm -f -- "$LOGIN_HOOK_PATH" || return 1
     fi
-    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer}; do
+    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer} vps-monitor-boot.service; do
         if [[ -f "${backup_dir}/units/${unit}" ]]; then
             install -o root -g root -m 0644 "${backup_dir}/units/${unit}" "${SYSTEMD_DIR}/${unit}" || return 1
         else
@@ -1321,6 +1621,9 @@ restore_update_backup() {
         fi
     done
     (( pam_line_was_present == 1 )) || remove_pam_login_line || return 1
+    if [[ -e "$BIN_PATH" || -L "$BIN_PATH" ]]; then
+        [[ -L "$BIN_PATH" && "$(readlink "$BIN_PATH")" == "$SCRIPT_PATH" ]] || return 1
+    fi
     ln -sfn "$SCRIPT_PATH" "$BIN_PATH" || return 1
     systemctl daemon-reload || return 1
     for component in collect report weekly monthly; do
@@ -1332,13 +1635,16 @@ restore_update_backup() {
     if (( ${#timers_to_enable[@]} > 0 )); then
         systemctl enable --now "${timers_to_enable[@]}" >/dev/null || return 1
     fi
+    if [[ -f "${SYSTEMD_DIR}/vps-monitor-boot.service" ]]; then
+        systemctl enable vps-monitor-boot.service >/dev/null || return 1
+    fi
 }
 
 run_update() {
     require_root; verify_supported_os; ensure_dependencies
     exec 8>"$UPDATE_LOCK_FILE"
     flock -n 8 || fatal "另一个更新任务正在运行，请稍后再试。"
-    [[ -f "$SCRIPT_PATH" && -x "$SCRIPT_PATH" && -e "$BIN_PATH" ]] \
+    [[ -f "$SCRIPT_PATH" && -x "$SCRIPT_PATH" ]] \
         || fatal "未检测到完整安装，请先运行 README 中的一键安装命令。"
     is_managed_service_account || fatal "专用系统账户状态异常，为避免影响其他程序，更新已停止。"
     load_config
@@ -1365,7 +1671,7 @@ run_update() {
     if [[ -f "$LOGIN_HOOK_PATH" ]]; then
         cp -p -- "$LOGIN_HOOK_PATH" "${backup_dir}/login-alert-hook"
     fi
-    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer}; do
+    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer} vps-monitor-boot.service; do
         if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
             cp -p -- "${SYSTEMD_DIR}/${unit}" "${backup_dir}/units/${unit}"
         fi
@@ -1379,7 +1685,7 @@ run_update() {
     local wait_deadline=$((SECONDS + 240)) active_service
     while :; do
         active_service=0
-        for unit in vps-monitor-{collect,report,weekly,monthly}.service; do
+        for unit in vps-monitor-{collect,report,weekly,monthly,boot}.service; do
             systemctl is-active --quiet "$unit" && active_service=1
         done
         (( active_service == 0 )) && break
@@ -1396,7 +1702,7 @@ run_update() {
         info "正在从 v${installed_version} 安全更新到 v${remote_version}……"
     fi
     if install -o root -g root -m 0755 "$downloaded" "$SCRIPT_PATH" \
-        && ln -sfn "$SCRIPT_PATH" "$BIN_PATH" \
+        && ensure_bin_link \
         && "$SCRIPT_PATH" __apply-update; then
         UPDATE_TIMERS_STOPPED=0
         if (( same_version == 1 )); then
@@ -1417,6 +1723,133 @@ run_update() {
     fatal "更新和自动恢复均未完整完成，定时任务已保持停止；请保留此输出并检查 systemd 状态，配置与统计目录未被删除。"
 }
 
+ensure_service_account_for_doctor() {
+    if is_managed_service_account; then
+        return
+    fi
+    if getent passwd "$SERVICE_USER" >/dev/null || getent group "$SERVICE_USER" >/dev/null; then
+        fatal "vpsmonitor 用户或用户组与程序要求不一致。为避免影响其他服务，doctor 已拒绝自动修改。"
+    fi
+    info "正在重建缺失的专用低权限账户……"
+    groupadd --system "$SERVICE_USER" || fatal "无法重建 vpsmonitor 用户组。"
+    if ! useradd --system --gid "$SERVICE_USER" --home-dir "$DATA_DIR" \
+        --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"; then
+        groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
+        fatal "无法重建 vpsmonitor 专用账户。"
+    fi
+}
+
+write_config_value() {
+    local destination="$1" value="$2" temporary
+    temporary="$(mktemp "${CONFIG_DIR}/config.XXXXXXXX")"
+    if ! printf '%s' "$value" > "$temporary" \
+        || ! chown root:"$SERVICE_USER" "$temporary" \
+        || ! chmod 0640 "$temporary" \
+        || ! mv -f -- "$temporary" "$destination"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+rebind_telegram_for_doctor() {
+    has_interactive_terminal \
+        || fatal "Telegram 配置或通知链路异常，需要交互式 SSH 终端重新安全绑定。"
+    local new_token new_chat_id
+    read -r -s -p '请输入 Bot Token（输入不会显示，可输入原 Token）：' new_token < /dev/tty
+    printf '\n' > /dev/tty
+    [[ "$new_token" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]] || fatal "Token 格式不正确。"
+    new_chat_id="$(resolve_telegram_uid "$new_token")"
+    write_config_value "$TOKEN_FILE" "$new_token" || fatal "无法保存修复后的 Token。"
+    write_config_value "$CHAT_ID_FILE" "$new_chat_id" || fatal "无法保存修复后的 UID。"
+    TOKEN="$new_token"; CHAT_ID="$new_chat_id"
+    success "Telegram Token 与 UID 已重新安全绑定"
+}
+
+load_and_repair_config_for_doctor() {
+    local needs_rebind=0
+    TOKEN=""; CHAT_ID=""; SERVER_NAME=""
+    [[ -r "$TOKEN_FILE" ]] && TOKEN="$(<"$TOKEN_FILE")"
+    [[ -r "$CHAT_ID_FILE" ]] && CHAT_ID="$(<"$CHAT_ID_FILE")"
+    [[ -r "$SERVER_NAME_FILE" ]] && SERVER_NAME="$(<"$SERVER_NAME_FILE")"
+    [[ "$TOKEN" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]] || needs_rebind=1
+    is_telegram_uid "$CHAT_ID" || needs_rebind=1
+    if (( needs_rebind == 1 )); then
+        rebind_telegram_for_doctor
+    fi
+    if ! is_server_name "$SERVER_NAME"; then
+        has_interactive_terminal || fatal "服务器名称无效，需要交互式 SSH 终端重新设置。"
+        SERVER_NAME="$(prompt_server_name)"
+        write_config_value "$SERVER_NAME_FILE" "$SERVER_NAME" || fatal "无法保存修复后的服务器名称。"
+        success "服务器名称已修复"
+    fi
+    INTERFACE=""
+    [[ -r "$INTERFACE_FILE" ]] && INTERFACE="$(<"$INTERFACE_FILE")"
+    if [[ ! "$INTERFACE" =~ ^[A-Za-z0-9_.:@-]{1,64}$ ]] || ! monitored_interface_is_readable; then
+        info "监控网卡失效，正在重新识别默认公网网卡……"
+        INTERFACE="$(detect_interface)"
+        write_config_value "$INTERFACE_FILE" "$INTERFACE" || fatal "无法保存重新识别的网卡。"
+        success "监控网卡已修复为：${INTERFACE}"
+    fi
+}
+
+doctor_app() {
+    require_root; verify_supported_os; ensure_dependencies
+    installed_script_is_managed || fatal "未找到可验证的程序主文件，doctor 无法安全重建自身；请重新运行一行安装命令。"
+    exec 8>"$UPDATE_LOCK_FILE"
+    flock -n 8 || fatal "更新或其他 doctor 任务正在运行，请稍后再试。"
+    WORK_DIR="$(mktemp -d -t vps-monitor-doctor.XXXXXXXX)"; chmod 0700 "$WORK_DIR"
+    trap cleanup_work_dir EXIT
+
+    printf '\n╭────────────────────────────────────╮\n│  VPS Monitor 自检与一键修复       │\n╰────────────────────────────────────╯\n\n'
+    ensure_service_account_for_doctor
+    install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
+    load_and_repair_config_for_doctor
+
+    systemctl stop vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+    UPDATE_TIMERS_STOPPED=1
+    local deadline=$((SECONDS + 240)) unit active
+    while :; do
+        active=0
+        for unit in vps-monitor-{collect,report,weekly,monthly,boot}.service; do
+            systemctl is-active --quiet "$unit" && active=1
+        done
+        (( active == 0 )) && break
+        (( SECONDS < deadline )) || fatal "监控任务长时间未结束，doctor 已停止以避免破坏正在写入的数据。"
+        sleep 1
+    done
+
+    info "正在修复文件权限、命令入口和统计状态……"
+    chown root:root "$SCRIPT_PATH"; chmod 0755 "$SCRIPT_PATH"
+    ensure_bin_link
+    install_managed_marker
+    chown root:"$SERVICE_USER" "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
+    chmod 0640 "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
+    chown -hR -- "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
+
+    info "正在重建 systemd 定时任务与 SSH 登录提醒……"
+    install_systemd_units
+    install_login_alert_hook
+    systemctl daemon-reload
+    runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
+    runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
+    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly,boot}.service \
+        vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+    systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null
+    systemctl enable vps-monitor-boot.service >/dev/null
+    UPDATE_TIMERS_STOPPED=0
+
+    info "正在验证 Telegram 通知链路……"
+    if ! runuser -u "$SERVICE_USER" -- "$BIN_PATH" doctor-notify >/dev/null; then
+        warn "Telegram 通知验证失败，可能是 Token 失效、机器人被停止或网络异常。"
+        rebind_telegram_for_doctor
+        runuser -u "$SERVICE_USER" -- "$BIN_PATH" doctor-notify >/dev/null \
+            || fatal "重新绑定后仍无法发送 Telegram 消息，请检查 VPS 网络和 Telegram 可用性。"
+    fi
+    success "自检和一键修复完成"
+    run_status
+}
+
 rename_server() {
     require_root
     is_managed_service_account || fatal "未检测到完整安装，无法修改服务器名称。"
@@ -1435,21 +1868,34 @@ rename_server() {
         fatal "服务器名称保存失败，原配置未被修改。"
     fi
     success "服务器名称已修改为：${new_name}"
-    printf '下一次测速汇报、月报和登录提醒将使用新名称。\n'
+    printf '下一次测速汇报、周报、月报、开机提醒和登录提醒将使用新名称。\n'
 }
 
 uninstall_app() {
     require_root
-    local managed_account=0 unit path pam_line
+    exec 8>"$UPDATE_LOCK_FILE"
+    flock -n 8 || fatal "更新或 doctor 正在运行，请稍后再卸载。"
+    local managed_account=0 managed_script=0 unit path pam_line
     local -a leftovers=()
     is_managed_service_account && managed_account=1
+    installed_script_is_managed && managed_script=1
+    if (( managed_account == 0 && managed_script == 0 )); then
+        fatal "未检测到本程序拥有的安装资源，已拒绝删除任何同名文件。"
+    fi
     pam_line="$(pam_login_line)"
 
     remove_pam_login_line || fatal "无法安全移除 SSH PAM 登录提醒，卸载已停止。"
     systemctl disable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
-    systemctl stop vps-monitor-{collect,report,weekly,monthly}.service >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-boot.service >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot}.service >/dev/null 2>&1 || true
     systemctl stop 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
-    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer} "$BIN_PATH" || true
+    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer} \
+        "${SYSTEMD_DIR}/vps-monitor-boot.service" || true
+    if [[ -L "$BIN_PATH" && "$(readlink "$BIN_PATH")" == "$SCRIPT_PATH" ]]; then
+        rm -f -- "$BIN_PATH" || true
+    elif [[ -e "$BIN_PATH" || -L "$BIN_PATH" ]]; then
+        leftovers+=("检测到非本程序拥有的命令入口，已保留 ${BIN_PATH}")
+    fi
     rm -rf -- "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" || true
 
     if (( managed_account == 1 )); then
@@ -1467,10 +1913,12 @@ uninstall_app() {
         leftovers+=("systemd 配置重新加载失败")
     fi
     systemctl reset-failed vps-monitor-{collect,report,weekly,monthly}.{service,timer} >/dev/null 2>&1 || true
+    systemctl reset-failed vps-monitor-boot.service >/dev/null 2>&1 || true
     systemctl reset-failed 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
 
     for path in "$BIN_PATH" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" \
         "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer} \
+        "${SYSTEMD_DIR}/vps-monitor-boot.service" \
         "${SYSTEMD_DIR}"/timers.target.wants/vps-monitor-{collect,report,weekly,monthly}.timer; do
         [[ ! -e "$path" && ! -L "$path" ]] || leftovers+=("$path")
     done
@@ -1478,6 +1926,8 @@ uninstall_app() {
         systemctl is-active --quiet "$unit" && leftovers+=("仍在运行的 systemd 单元 ${unit}")
         systemctl is-enabled --quiet "$unit" && leftovers+=("仍然启用的 systemd 单元 ${unit}")
     done
+    systemctl is-active --quiet vps-monitor-boot.service && leftovers+=("仍在运行的 systemd 单元 vps-monitor-boot.service")
+    systemctl is-enabled --quiet vps-monitor-boot.service && leftovers+=("仍然启用的 systemd 单元 vps-monitor-boot.service")
     if systemctl list-units --state=active --type=service --plain --no-legend \
         'vps-monitor-login-alert-*.service' 2>/dev/null | grep -q .; then
         leftovers+=("仍在运行的 SSH 登录提醒任务")
@@ -1491,6 +1941,8 @@ uninstall_app() {
         getent group "$SERVICE_USER" >/dev/null && leftovers+=("专用用户组 ${SERVICE_USER}")
     fi
 
+    rm -f -- "$UPDATE_LOCK_FILE" || true
+    [[ ! -e "$UPDATE_LOCK_FILE" ]] || leftovers+=("$UPDATE_LOCK_FILE")
     if (( ${#leftovers[@]} > 0 )); then
         warn "卸载未完全完成，以下项目仍然存在："
         printf '  - %s\n' "${leftovers[@]}"
@@ -1501,12 +1953,13 @@ uninstall_app() {
 }
 
 usage() {
-    printf '用法：vps-monitor {collect|report|weekly|monthly|test|status|rename|update|uninstall}\n'
+    printf '用法：vps-monitor {status|doctor|test|report|weekly|monthly|collect|rename|update|uninstall|--version}\n'
 }
 
 main() {
     case "${1:-install}" in
-        collect|report|weekly|monthly|test|login-alert) run_as_service_user_if_needed "$@" ;;
+        collect|report|weekly|monthly|test|login-alert|boot-alert|init-boot-alert|doctor-notify) \
+            run_as_service_user_if_needed "$@" ;;
     esac
     case "${1:-install}" in
         install) install_app ;;
@@ -1516,7 +1969,11 @@ main() {
         monthly) run_monthly ;;
         test) run_test_message ;;
         login-alert) run_login_alert ;;
+        boot-alert) run_boot_alert ;;
+        init-boot-alert) initialize_boot_alert_state ;;
+        doctor-notify) run_doctor_message ;;
         status) run_status ;;
+        doctor) doctor_app ;;
         rename) rename_server ;;
         update) run_update ;;
         __apply-update) apply_installed_update ;;
