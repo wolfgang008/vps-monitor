@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031 # Test cases intentionally isolate global overrides in subshells.
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -43,9 +44,19 @@ test_supported_os() (
         printf 'FAIL: unsupported Debian version was accepted\n' >&2
         exit 1
     fi
+    printf 'ID=debian\nVERSION_ID="13"\nPRETTY_NAME="Debian GNU/Linux 13 (trixie)"\n' > "$os_release"
+    if (verify_supported_os) >/dev/null 2>&1; then
+        printf 'FAIL: Debian 13 was accepted\n' >&2
+        exit 1
+    fi
     printf 'ID=ubuntu\nVERSION_ID="20.04"\nPRETTY_NAME="Ubuntu 20.04 LTS"\n' > "$os_release"
     if (verify_supported_os) >/dev/null 2>&1; then
         printf 'FAIL: unsupported Ubuntu version was accepted\n' >&2
+        exit 1
+    fi
+    printf 'ID=ubuntu\nVERSION_ID="26.04"\nPRETTY_NAME="Ubuntu 26.04 LTS"\n' > "$os_release"
+    if (verify_supported_os) >/dev/null 2>&1; then
+        printf 'FAIL: Ubuntu 26.04 was accepted\n' >&2
         exit 1
     fi
 )
@@ -119,8 +130,20 @@ assert_equal "10" "$update_cursor" "Telegram start cursor"
 assert_equal "987654321" "$matched_uid" "Telegram secure start UID"
 
 expected_two_hour=$'测试服务器\n进站速度: 10.15 MB/s\n出站速度: 10.07 MB/s\n总流量: 2.51 TB\nCPU利用率: 29%'
-actual_two_hour="$(format_two_hour_message 73080000000 72504000000 29 100 2510000000000)"
+actual_two_hour="$(format_two_hour_message 73080000000 72504000000 29 100 7200 2510000000000)"
 assert_equal "$expected_two_hour" "$actual_two_hour" "two-hour message format"
+partial_coverage_message="$(format_two_hour_message 64800000000 32400000000 29 100 6480 1000000000000)"
+grep -Fqx '进站速度: 10.00 MB/s' <<< "$partial_coverage_message"
+grep -Fqx '出站速度: 5.00 MB/s' <<< "$partial_coverage_message"
+
+forecast_now="$(date -d '2026-08-16 00:00:00 UTC' +%s)"
+forecast_seconds=$((15 * 86400))
+forecast_value="$(calculate_month_forecast "$forecast_now" 15000000000000 "$forecast_seconds")"
+assert_equal "31000000000000" "$forecast_value" "month-end forecast"
+if calculate_month_forecast "$forecast_now" 1000000000 60 >/dev/null; then
+    printf 'FAIL: forecast accepted insufficient observation time\n' >&2
+    exit 1
+fi
 
 expected_month=$'测试服务器 2026年8月流量报告\n进站流量: 1.42 TB\n出站流量: 1.09 TB\n总流量: 2.51 TB\n平均CPU利用率: 29%'
 actual_month="$(format_month_message 2026-08 1420000000000 1090000000000 29 100)"
@@ -129,6 +152,13 @@ assert_equal "$expected_month" "$actual_month" "monthly message format"
 expected_week=$'测试服务器\n上一周的流量使用情况为：\n进站流量: 0.12 TB\n出站流量: 0.08 TB\n总流量: 0.20 TB'
 actual_week="$(format_week_message 120000000000 80000000000)"
 assert_equal "$expected_week" "$actual_week" "weekly message format"
+assert_equal "2025-W52" "$(previous_week_key 2026-W01)" "previous ISO week key"
+
+boot_epoch="$(date -d '2026-08-05 10:00:00 UTC' +%s)"
+boot_now="$(date -d '2026-08-05 12:30:00 UTC' +%s)"
+boot_message="$(format_boot_message "$boot_epoch" "$boot_now")"
+grep -Fqx '状态: 已启动并恢复监控' <<< "$boot_message"
+grep -Fqx '预计离线: 2 小时 30 分钟' <<< "$boot_message"
 
 version_is_newer 1.5.0 1.4.9 || { printf 'FAIL: newer version was rejected\n' >&2; exit 1; }
 if version_is_newer 1.5.0 1.5.0 || version_is_newer 1.4.9 1.5.0; then
@@ -175,6 +205,33 @@ assert_equal "$expected_login" "$actual_login" "SSH login alert format"
 login_prefix=$'⚠️ VPS 登录提醒\n服务器: 测试服务器\n登录用户: root\n来源IP: 203.0.113.8\n登录时间: '
 [[ "$(<"${TEST_DIR}/captured-login-alert")" == "${login_prefix}"* ]] \
     || { printf 'FAIL: SSH login alert delivery\n' >&2; exit 1; }
+
+test_boot_alert_delivery() (
+    DATA_DIR="${TEST_DIR}/boot-alert"
+    STATE_FILE="${DATA_DIR}/state.tsv"
+    LOCK_FILE="${DATA_DIR}/monitor.lock"
+    BOOT_ID_FILE="${DATA_DIR}/boot-id"
+    mkdir -p "$DATA_DIR"
+    printf '%s' 11111111-2222-3333-4444-555555555555 > "$BOOT_ID_FILE"
+    reset_state_defaults
+    LAST_TS=$(( $(date +%s) - 600 ))
+    LAST_BOOT=00000000-0000-0000-0000-000000000001
+    LAST_INTERFACE=eth0
+    BOOT_ALERTED="$LAST_BOOT"
+    save_state
+    # shellcheck disable=SC2317,SC2329 # Called by the boot alert command.
+    load_config() { :; }
+    # shellcheck disable=SC2317,SC2329 # Captures boot alert delivery.
+    send_message() {
+        printf '%s' "$1" > "${DATA_DIR}/captured-message"
+        printf 'sent\n' >> "${DATA_DIR}/send-count"
+    }
+    assert_equal "boot-alert: sent" "$(run_boot_alert)" "boot recovery alert delivery"
+    grep -Fqx '状态: 已启动并恢复监控' "${DATA_DIR}/captured-message"
+    assert_equal "boot-alert: duplicate-skipped" "$(run_boot_alert)" "boot alert duplicate prevention"
+    assert_equal "1" "$(wc -l < "${DATA_DIR}/send-count")" "boot alert send count"
+)
+(test_boot_alert_delivery)
 
 render_login_hook > "${TEST_DIR}/login-alert-hook"
 sh -n "${TEST_DIR}/login-alert-hook"
@@ -254,6 +311,23 @@ assert_equal "25.000000" "$busy" "window busy"
 assert_equal "100.000000" "$total" "window total"
 assert_equal "60.000000" "$coverage" "window coverage"
 
+(
+    DATA_DIR="${TEST_DIR}/lock-contention"
+    LOCK_FILE="${DATA_DIR}/monitor.lock"
+    mkdir -p "$DATA_DIR"
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced collector/report paths.
+    load_config() { :; }
+    # shellcheck disable=SC2317,SC2329 # Simulates a busy statistics lock.
+    flock() { return 1; }
+    collector_busy_output="$(run_collect 2>/dev/null)"
+    [[ "$collector_busy_output" == *$'\ncollect: lock-busy-skipped' ]] \
+        || { printf 'FAIL: collector did not safely skip lock contention\n' >&2; exit 1; }
+    if (run_report) >/dev/null 2>&1; then
+        printf 'FAIL: report lock contention was reported as success\n' >&2
+        exit 1
+    fi
+)
+
 pwned="${TEST_DIR}/pwned"
 # shellcheck disable=SC2016 # Literal payload verifies that state is never executed.
 printf 'month_rx\t$(touch %s)\nmonth_tx\t42\n' "$pwned" > "$STATE_FILE"
@@ -262,6 +336,8 @@ assert_equal "0" "$MONTH_RX" "invalid state rejected"
 assert_equal "42" "$MONTH_TX" "valid state accepted"
 assert_equal "" "$STATE_WEEK" "legacy state starts without weekly key"
 assert_equal "0" "$WEEK_RX" "legacy state starts with zero weekly rx"
+assert_equal "0" "$PREVIOUS_BOOT_LAST_TS" "legacy state starts without previous boot timestamp"
+assert_equal "" "$BOOT_ALERTED" "legacy state starts without boot alert marker"
 [[ ! -e "$pwned" ]] || { printf 'FAIL: state file was executed\n' >&2; exit 1; }
 
 STATE_MONTH="2026-07"
@@ -319,6 +395,13 @@ assert_equal "2026-08" "$STATE_MONTH" "multi-month current month"
 assert_equal "36000000000" "$MONTH_RX" "multi-month August rx"
 assert_equal "18000000000" "$MONTH_TX" "multi-month August tx"
 assert_equal "3600" "$MONTH_SECONDS" "multi-month August duration"
+
+empty_month_archive="${DATA_DIR}/month-2025-01.tsv"
+rm -f -- "$empty_month_archive"
+STATE_MONTH="2025-01"; MONTH_RX=0; MONTH_TX=0; MONTH_CPU_BUSY=0; MONTH_CPU_TOTAL=0; MONTH_SECONDS=0
+archive_current_month
+[[ ! -e "$empty_month_archive" ]] \
+    || { printf 'FAIL: empty month created a false zero archive\n' >&2; exit 1; }
 
 STATE_MONTH="2026-05"
 MONTH_RX=100; MONTH_TX=200; MONTH_CPU_BUSY=10; MONTH_CPU_TOTAL=50; MONTH_SECONDS=60
@@ -449,6 +532,14 @@ queue_oldest="$(date -d "${queue_current}-01 -2 months" +%Y-%m)"
 assert_equal "$queue_oldest" "$(oldest_unsent_month)" "oldest monthly report is retried first"
 : > "${DATA_DIR}/sent-${queue_oldest}"
 assert_equal "$queue_recent" "$(oldest_unsent_month)" "monthly queue advances after marker"
+
+trend_dir="${TEST_DIR}/weekly-trend"
+mkdir -p "$trend_dir"
+DATA_DIR="$trend_dir"
+printf '60000000000\t40000000000\t604800\n' > "${DATA_DIR}/week-2026-W32.tsv"
+assert_equal "+100.0%" "$(calculate_week_trend 2026-W33 120000000000 80000000000)" "weekly trend"
+trend_message="$(format_week_message 120000000000 80000000000 '+100.0%')"
+grep -Fqx '较前一周: +100.0%' <<< "$trend_message"
 DATA_DIR="$TEST_DIR"
 STATE_FILE="${DATA_DIR}/state.tsv"
 SAMPLES_FILE="${DATA_DIR}/samples.tsv"
@@ -467,6 +558,9 @@ grep -Fxq 'ExecStart=/bin/true weekly' "${SYSTEMD_DIR}/vps-monitor-weekly.servic
 grep -Fxq 'NoNewPrivileges=yes' "${SYSTEMD_DIR}/vps-monitor-weekly.service"
 grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' "${SYSTEMD_DIR}/vps-monitor-weekly.service"
 grep -Fxq 'OnCalendar=*-*-* 00:05:00' "${SYSTEMD_DIR}/vps-monitor-monthly.timer"
+grep -Fxq 'ExecStart=/bin/true boot-alert' "${SYSTEMD_DIR}/vps-monitor-boot.service"
+grep -Fxq 'WantedBy=multi-user.target' "${SYSTEMD_DIR}/vps-monitor-boot.service"
+grep -Fxq 'Restart=on-failure' "${SYSTEMD_DIR}/vps-monitor-boot.service"
 if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify "${SYSTEMD_DIR}"/*.service "${SYSTEMD_DIR}"/*.timer
 fi
@@ -475,16 +569,55 @@ fi
     SYSTEMD_DIR="${TEST_DIR}/failed-v162-apply"
     APPLY_UPDATE_WEEKLY_SERVICE_EXISTED=0
     APPLY_UPDATE_WEEKLY_TIMER_EXISTED=0
+    APPLY_UPDATE_BOOT_SERVICE_EXISTED=0
+    APPLY_UPDATE_MANAGED_MARKER_EXISTED=0
     mkdir -p "$SYSTEMD_DIR"
     : > "${SYSTEMD_DIR}/vps-monitor-weekly.service"
     : > "${SYSTEMD_DIR}/vps-monitor-weekly.timer"
+    : > "${SYSTEMD_DIR}/vps-monitor-boot.service"
+    MANAGED_MARKER_PATH="${SYSTEMD_DIR}/managed-marker"
+    : > "$MANAGED_MARKER_PATH"
     # shellcheck disable=SC2317,SC2329 # Called by failed apply cleanup.
     systemctl() { return 0; }
     cleanup_failed_apply_units
-    for unit_name in vps-monitor-weekly.{service,timer}; do
+    for unit_name in vps-monitor-weekly.{service,timer} vps-monitor-boot.service; do
         [[ ! -e "${SYSTEMD_DIR}/${unit_name}" ]] \
             || { printf 'FAIL: v1.6.2 failed apply left %s\n' "$unit_name" >&2; exit 1; }
     done
+    [[ ! -e "$MANAGED_MARKER_PATH" ]] \
+        || { printf 'FAIL: failed apply left managed marker\n' >&2; exit 1; }
+)
+
+(
+    ROLLBACK_ROOT="${TEST_DIR}/failed-install"
+    SYSTEMD_DIR="${ROLLBACK_ROOT}/systemd"
+    BIN_PATH="${ROLLBACK_ROOT}/bin/vps-monitor"
+    INSTALL_DIR="${ROLLBACK_ROOT}/lib/vps-monitor"
+    CONFIG_DIR="${ROLLBACK_ROOT}/etc/vps-monitor"
+    DATA_DIR="${ROLLBACK_ROOT}/var/vps-monitor"
+    PAM_SSHD_FILE="${ROLLBACK_ROOT}/pam-sshd"
+    UPDATE_LOCK_FILE="${ROLLBACK_ROOT}/update.lock"
+    INSTALL_CREATED_SERVICE_ACCOUNT=1
+    INSTALL_CREATED_SERVICE_GROUP=1
+    mkdir -p "$SYSTEMD_DIR" "$(dirname -- "$BIN_PATH")" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
+    : > "$BIN_PATH"; : > "$PAM_SSHD_FILE"; : > "$UPDATE_LOCK_FILE"
+    ensure_pam_login_line
+    # shellcheck disable=SC2317,SC2329 # Called by failed install cleanup.
+    systemctl() { return 0; }
+    # shellcheck disable=SC2317,SC2329 # Records account cleanup without touching the runner.
+    userdel() { : > "${ROLLBACK_ROOT}/user-removed"; }
+    # shellcheck disable=SC2317,SC2329 # Records group cleanup without touching the runner.
+    groupdel() { : > "${ROLLBACK_ROOT}/group-removed"; }
+    cleanup_failed_install
+    for removed_path in "$BIN_PATH" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" "$UPDATE_LOCK_FILE"; do
+        [[ ! -e "$removed_path" && ! -L "$removed_path" ]] \
+            || { printf 'FAIL: failed install rollback left %s\n' "$removed_path" >&2; exit 1; }
+    done
+    [[ -e "${ROLLBACK_ROOT}/user-removed" && -e "${ROLLBACK_ROOT}/group-removed" ]] \
+        || { printf 'FAIL: failed install rollback left service account\n' >&2; exit 1; }
+    grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE" \
+        && { printf 'FAIL: failed install rollback left PAM line\n' >&2; exit 1; }
+    true
 )
 
 if ! (
@@ -532,7 +665,7 @@ fi
     printf '#!/usr/bin/env sh\nexit 0\n' > "$LOGIN_HOOK_PATH"
     printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.5.2"\nexit 1\n' > "$candidate"
     chmod 0700 "$SCRIPT_PATH" "$LOGIN_HOOK_PATH" "$candidate"
-    : > "$BIN_PATH"; : > "$PAM_SSHD_FILE"
+    : > "$PAM_SSHD_FILE"
     for unit_name in vps-monitor-{collect,report,monthly}.{service,timer}; do
         printf 'old unit %s\n' "$unit_name" > "${SYSTEMD_DIR}/${unit_name}"
     done
@@ -568,16 +701,20 @@ fi
         command chmod 0700 "$2"
     }
 
-    if (run_update) >/dev/null 2>&1; then
+    if (run_update) > "${UPDATE_ROOT}/update-output.log" 2>&1; then
         printf 'FAIL: failed update was reported as successful\n' >&2
         exit 1
     fi
-    assert_equal "1.5.1" "$(script_version "$SCRIPT_PATH")" "failed update script rollback"
+    if [[ "$(script_version "$SCRIPT_PATH")" != 1.5.1 ]]; then
+        cat "${UPDATE_ROOT}/update-output.log" >&2
+        printf 'FAIL: failed update script rollback\n' >&2
+        exit 1
+    fi
     for unit_name in vps-monitor-{collect,report,monthly}.{service,timer}; do
         grep -Fqx "old unit ${unit_name}" "${SYSTEMD_DIR}/${unit_name}" \
             || { printf 'FAIL: failed update did not restore %s\n' "$unit_name" >&2; exit 1; }
     done
-    for unit_name in vps-monitor-weekly.{service,timer}; do
+    for unit_name in vps-monitor-weekly.{service,timer} vps-monitor-boot.service; do
         [[ ! -e "${SYSTEMD_DIR}/${unit_name}" ]] \
             || { printf 'FAIL: failed pre-weekly update left %s\n' "$unit_name" >&2; exit 1; }
     done
@@ -599,11 +736,11 @@ fi
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         '# VPS_TELEGRAM_MONITOR_SCRIPT=1' \
-        'VERSION="1.7.0"' \
+        'VERSION="1.8.0"' \
         'if [[ "${1:-}" == "__apply-update" ]]; then : > "$REPAIR_HOOK"; fi' > "$candidate"
     cp -- "$candidate" "$SCRIPT_PATH"
     chmod 0700 "$SCRIPT_PATH" "$candidate"
-    : > "$BIN_PATH"; : > "$PAM_SSHD_FILE"
+    : > "$PAM_SSHD_FILE"
 
     # shellcheck disable=SC2317,SC2329 # Called by the sourced updater.
     require_root() { :; }
@@ -642,14 +779,52 @@ fi
 )
 
 (
+    DOCTOR_ROOT="${TEST_DIR}/doctor"
+    UPDATE_LOCK_FILE="${DOCTOR_ROOT}/update.lock"
+    CONFIG_DIR="${DOCTOR_ROOT}/etc"
+    DATA_DIR="${DOCTOR_ROOT}/data"
+    SCRIPT_PATH="${DOCTOR_ROOT}/installed.sh"
+    BIN_PATH="${DOCTOR_ROOT}/bin/vps-monitor"
+    mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$(dirname -- "$BIN_PATH")"
+    : > "$SCRIPT_PATH"
+    # shellcheck disable=SC2317,SC2329 # Doctor orchestration test stubs privileged operations.
+    require_root() { :; }
+    verify_supported_os() { :; }
+    ensure_dependencies() { :; }
+    installed_script_is_managed() { return 0; }
+    ensure_service_account_for_doctor() { :; }
+    load_and_repair_config_for_doctor() { TOKEN=x; CHAT_ID=1; SERVER_NAME=测试服务器; INTERFACE=eth0; }
+    ensure_bin_link() { :; }
+    install_managed_marker() { :; }
+    install_systemd_units() { : > "${DOCTOR_ROOT}/units-repaired"; }
+    install_login_alert_hook() { : > "${DOCTOR_ROOT}/pam-repaired"; }
+    run_status() { printf 'doctor-status-ok\n'; }
+    flock() { return 0; }
+    install() { return 0; }
+    chown() { return 0; }
+    chmod() { return 0; }
+    systemctl() { [[ "${1:-}" != is-active ]]; }
+    runuser() { printf '%s\n' "$*" >> "${DOCTOR_ROOT}/runuser-calls"; }
+    doctor_output="$(doctor_app)"
+    grep -Fq '[完成] 自检和一键修复完成' <<< "$doctor_output"
+    grep -Fq ' collect' "${DOCTOR_ROOT}/runuser-calls"
+    grep -Fq ' init-boot-alert' "${DOCTOR_ROOT}/runuser-calls"
+    grep -Fq ' doctor-notify' "${DOCTOR_ROOT}/runuser-calls"
+    [[ -e "${DOCTOR_ROOT}/units-repaired" && -e "${DOCTOR_ROOT}/pam-repaired" ]] \
+        || { printf 'FAIL: doctor did not rebuild managed resources\n' >&2; exit 1; }
+)
+
+(
     UNINSTALL_ROOT="${TEST_DIR}/uninstall"
     SYSTEMD_DIR="${UNINSTALL_ROOT}/systemd"
     BIN_PATH="${UNINSTALL_ROOT}/bin/vps-monitor"
     INSTALL_DIR="${UNINSTALL_ROOT}/lib/vps-monitor"
+    SCRIPT_PATH="${INSTALL_DIR}/TG-check-notify.sh"
     CONFIG_DIR="${UNINSTALL_ROOT}/etc/vps-monitor"
     DATA_DIR="${UNINSTALL_ROOT}/var/vps-monitor"
     LOGIN_HOOK_PATH="${INSTALL_DIR}/login-alert-hook"
     PAM_SSHD_FILE="${UNINSTALL_ROOT}/pam-sshd"
+    UPDATE_LOCK_FILE="${UNINSTALL_ROOT}/vps-monitor-update.lock"
 
     # shellcheck disable=SC2317,SC2329 # Called by the sourced uninstaller.
     require_root() { :; }
@@ -670,20 +845,27 @@ fi
 
     mkdir -p "$SYSTEMD_DIR/timers.target.wants" "$(dirname -- "$BIN_PATH")" \
         "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
-    : > "$BIN_PATH"; : > "$LOGIN_HOOK_PATH"; : > "$PAM_SSHD_FILE"
+    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.8.0"\n' > "$SCRIPT_PATH"
+    : > "$LOGIN_HOOK_PATH"; : > "$PAM_SSHD_FILE"; : > "$UPDATE_LOCK_FILE"
     ensure_pam_login_line
     for unit_name in vps-monitor-{collect,report,weekly,monthly}.{service,timer}; do
         : > "${SYSTEMD_DIR}/${unit_name}"
     done
+    : > "${SYSTEMD_DIR}/vps-monitor-boot.service"
     for timer_name in vps-monitor-{collect,report,weekly,monthly}.timer; do
         : > "${SYSTEMD_DIR}/timers.target.wants/${timer_name}"
     done
 
-    uninstall_app >/dev/null
+    if ! (uninstall_app) > "${UNINSTALL_ROOT}/uninstall-output.log" 2>&1; then
+        cat "${UNINSTALL_ROOT}/uninstall-output.log" >&2
+        printf 'FAIL: uninstall command failed\n' >&2
+        exit 1
+    fi
     for removed_path in "$BIN_PATH" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"; do
         [[ ! -e "$removed_path" && ! -L "$removed_path" ]] \
             || { printf 'FAIL: uninstall left %s\n' "$removed_path" >&2; exit 1; }
     done
+    [[ ! -e "$UPDATE_LOCK_FILE" ]] || { printf 'FAIL: uninstall left update lock\n' >&2; exit 1; }
     if grep -Fqx "$PAM_MARKER" "$PAM_SSHD_FILE" || grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE"; then
         printf 'FAIL: uninstall left PAM configuration\n' >&2
         exit 1
