@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.6.2"
+VERSION="1.7.0"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -52,9 +52,16 @@ MONTH_TX=0
 MONTH_CPU_BUSY=0
 MONTH_CPU_TOTAL=0
 MONTH_SECONDS=0
+STATE_WEEK=""
+WEEK_RX=0
+WEEK_TX=0
+WEEK_SECONDS=0
 LAST_REPORT=0
 WORK_DIR=""
 UPDATE_TIMERS_STOPPED=0
+APPLY_UPDATE_IN_PROGRESS=0
+APPLY_UPDATE_WEEKLY_SERVICE_EXISTED=0
+APPLY_UPDATE_WEEKLY_TIMER_EXISTED=0
 PROPORTIONAL_RESULT=0
 
 if [[ -t 1 ]]; then
@@ -69,6 +76,7 @@ warn() { printf '%s[注意]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 fatal() { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 is_telegram_uid() { [[ "${1:-}" =~ ^[1-9][0-9]{0,19}$ ]]; }
+is_week_key() { [[ "${1:-}" =~ ^[0-9]{4}-W(0[1-9]|[1-4][0-9]|5[0-3])$ ]]; }
 has_interactive_terminal() {
     { : < /dev/tty; } 2>/dev/null && { : > /dev/tty; } 2>/dev/null
 }
@@ -77,9 +85,24 @@ is_server_name() {
     [[ ${#value} -le 80 && "$value" =~ [^[:space:]] && ! "$value" =~ $control_pattern ]]
 }
 
+cleanup_failed_apply_units() {
+    systemctl disable --now vps-monitor-weekly.timer >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-weekly.service >/dev/null 2>&1 || true
+    if (( APPLY_UPDATE_WEEKLY_SERVICE_EXISTED == 0 )); then
+        rm -f -- "${SYSTEMD_DIR}/vps-monitor-weekly.service" || true
+    fi
+    if (( APPLY_UPDATE_WEEKLY_TIMER_EXISTED == 0 )); then
+        rm -f -- "${SYSTEMD_DIR}/vps-monitor-weekly.timer" || true
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 cleanup_work_dir() {
+    if (( APPLY_UPDATE_IN_PROGRESS == 1 )) && (( EUID == 0 )) && command -v systemctl >/dev/null; then
+        cleanup_failed_apply_units
+    fi
     if (( UPDATE_TIMERS_STOPPED == 1 )) && (( EUID == 0 )) && command -v systemctl >/dev/null; then
-        systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
+        systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
     fi
     if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
         rm -rf -- "$WORK_DIR"
@@ -103,7 +126,8 @@ reset_state_defaults() {
     LAST_TS=0; LAST_BOOT=""; LAST_INTERFACE=""; LAST_RX=0; LAST_TX=0
     LAST_CPU_BUSY=0; LAST_CPU_TOTAL=0; STATE_MONTH=""
     MONTH_RX=0; MONTH_TX=0; MONTH_CPU_BUSY=0; MONTH_CPU_TOTAL=0
-    MONTH_SECONDS=0; LAST_REPORT=0
+    MONTH_SECONDS=0; STATE_WEEK=""; WEEK_RX=0; WEEK_TX=0; WEEK_SECONDS=0
+    LAST_REPORT=0
 }
 
 load_state() {
@@ -125,6 +149,10 @@ load_state() {
             month_cpu_busy) is_uint "$value" && MONTH_CPU_BUSY="$value" ;;
             month_cpu_total) is_uint "$value" && MONTH_CPU_TOTAL="$value" ;;
             month_seconds) is_uint "$value" && MONTH_SECONDS="$value" ;;
+            week) is_week_key "$value" && STATE_WEEK="$value" ;;
+            week_rx) is_uint "$value" && WEEK_RX="$value" ;;
+            week_tx) is_uint "$value" && WEEK_TX="$value" ;;
+            week_seconds) is_uint "$value" && WEEK_SECONDS="$value" ;;
             last_report) is_uint "$value" && LAST_REPORT="$value" ;;
         esac
     done < "$STATE_FILE"
@@ -147,6 +175,10 @@ save_state() {
         month_cpu_busy "$MONTH_CPU_BUSY" \
         month_cpu_total "$MONTH_CPU_TOTAL" \
         month_seconds "$MONTH_SECONDS" \
+        week "$STATE_WEEK" \
+        week_rx "$WEEK_RX" \
+        week_tx "$WEEK_TX" \
+        week_seconds "$WEEK_SECONDS" \
         last_report "$LAST_REPORT" > "$temporary"
     chmod 0600 "$temporary"
     mv -f -- "$temporary" "$STATE_FILE"
@@ -195,6 +227,27 @@ roll_month_without_delta() {
         MONTH_RX=0; MONTH_TX=0; MONTH_CPU_BUSY=0; MONTH_CPU_TOTAL=0; MONTH_SECONDS=0
     elif [[ -z "$STATE_MONTH" ]]; then
         STATE_MONTH="$current_month"
+    fi
+}
+
+archive_current_week() {
+    is_week_key "$STATE_WEEK" || return 0
+    (( WEEK_SECONDS > 0 )) || return 0
+    local archive="${DATA_DIR}/week-${STATE_WEEK}.tsv" temporary
+    temporary="$(mktemp "${DATA_DIR}/week.XXXXXXXX")"
+    printf '%s\t%s\t%s\n' "$WEEK_RX" "$WEEK_TX" "$WEEK_SECONDS" > "$temporary"
+    chmod 0600 "$temporary"
+    mv -f -- "$temporary" "$archive"
+}
+
+roll_week_without_delta() {
+    local current_week="$1"
+    if [[ -n "$STATE_WEEK" && "$STATE_WEEK" != "$current_week" ]]; then
+        archive_current_week
+        STATE_WEEK="$current_week"
+        WEEK_RX=0; WEEK_TX=0; WEEK_SECONDS=0
+    elif [[ -z "$STATE_WEEK" ]]; then
+        STATE_WEEK="$current_week"
     fi
 }
 
@@ -261,6 +314,55 @@ add_month_delta() {
     done
 }
 
+add_week_delta() {
+    local current_week="$1" elapsed="$2" rx_delta="$3" tx_delta="$4"
+    if [[ -z "$STATE_WEEK" ]]; then
+        STATE_WEEK="$(date -d "@${LAST_TS}" +%G-W%V)" || fatal "无法初始化周度统计周次。"
+        is_week_key "$STATE_WEEK" || fatal "周度统计初始周次异常。"
+    fi
+    if [[ "$STATE_WEEK" == "$current_week" ]]; then
+        WEEK_RX=$((WEEK_RX + rx_delta)); WEEK_TX=$((WEEK_TX + tx_delta))
+        WEEK_SECONDS=$((WEEK_SECONDS + elapsed))
+        return
+    fi
+
+    local cursor="$LAST_TS" segment_week calendar_date weekday days_to_monday
+    local boundary segment_end segment_seconds cumulative_seconds
+    local cumulative_rx cumulative_tx allocated_rx=0 allocated_tx=0 segment_rx segment_tx
+    while (( cursor < CURRENT_TS )); do
+        segment_week="$(date -d "@${cursor}" +%G-W%V)" || fatal "无法计算跨周统计周次。"
+        is_week_key "$segment_week" || fatal "跨周统计周次异常。"
+        calendar_date="$(date -d "@${cursor}" +%F)" || fatal "无法计算跨周统计日期。"
+        weekday="$(date -d "@${cursor}" +%u)" || fatal "无法计算跨周统计星期。"
+        [[ "$weekday" =~ ^[1-7]$ ]] || fatal "跨周统计星期异常。"
+        days_to_monday=$((8 - 10#$weekday))
+        boundary="$(date -d "${calendar_date} + ${days_to_monday} days 00:00:00" +%s)" \
+            || fatal "无法计算跨周统计边界。"
+        if ! is_uint "$boundary" || (( boundary <= cursor )); then
+            fatal "跨周统计边界异常。"
+        fi
+        segment_end="$boundary"
+        (( segment_end > CURRENT_TS )) && segment_end="$CURRENT_TS"
+        segment_seconds=$((segment_end - cursor))
+        cumulative_seconds=$((segment_end - LAST_TS))
+
+        proportional_floor "$rx_delta" "$cumulative_seconds" "$elapsed"; cumulative_rx="$PROPORTIONAL_RESULT"
+        proportional_floor "$tx_delta" "$cumulative_seconds" "$elapsed"; cumulative_tx="$PROPORTIONAL_RESULT"
+        segment_rx=$((cumulative_rx - allocated_rx)); segment_tx=$((cumulative_tx - allocated_tx))
+
+        if [[ -n "$STATE_WEEK" && "$STATE_WEEK" != "$segment_week" ]]; then
+            archive_current_week
+            WEEK_RX=0; WEEK_TX=0; WEEK_SECONDS=0
+        fi
+        STATE_WEEK="$segment_week"
+        WEEK_RX=$((WEEK_RX + segment_rx)); WEEK_TX=$((WEEK_TX + segment_tx))
+        WEEK_SECONDS=$((WEEK_SECONDS + segment_seconds))
+
+        allocated_rx="$cumulative_rx"; allocated_tx="$cumulative_tx"
+        cursor="$segment_end"
+    done
+}
+
 prune_samples() {
     [[ -f "$SAMPLES_FILE" ]] || return 0
     local cutoff temporary
@@ -274,11 +376,14 @@ prune_samples() {
 collect_locked() {
     load_state
     read_counters
-    local current_month elapsed rx_delta tx_delta busy_delta total_delta
+    local current_month current_week elapsed rx_delta tx_delta busy_delta total_delta
     current_month="$(date -d "@${CURRENT_TS}" +%Y-%m)"
+    current_week="$(date -d "@${CURRENT_TS}" +%G-W%V)"
+    is_week_key "$current_week" || fatal "无法计算当前统计周次。"
 
     if (( LAST_TS == 0 )) || [[ "$LAST_BOOT" != "$CURRENT_BOOT" || "$LAST_INTERFACE" != "$INTERFACE" ]]; then
         roll_month_without_delta "$current_month"
+        roll_week_without_delta "$current_week"
         LAST_TS="$CURRENT_TS"; LAST_BOOT="$CURRENT_BOOT"; LAST_INTERFACE="$INTERFACE"
         LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"
         LAST_CPU_BUSY="$CURRENT_CPU_BUSY"; LAST_CPU_TOTAL="$CURRENT_CPU_TOTAL"
@@ -291,6 +396,7 @@ collect_locked() {
     busy_delta=$((CURRENT_CPU_BUSY - LAST_CPU_BUSY)); total_delta=$((CURRENT_CPU_TOTAL - LAST_CPU_TOTAL))
     if (( elapsed <= 0 || rx_delta < 0 || tx_delta < 0 || busy_delta < 0 || total_delta <= 0 || busy_delta > total_delta )); then
         roll_month_without_delta "$current_month"
+        roll_week_without_delta "$current_week"
         LAST_TS="$CURRENT_TS"; LAST_BOOT="$CURRENT_BOOT"; LAST_INTERFACE="$INTERFACE"
         LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"
         LAST_CPU_BUSY="$CURRENT_CPU_BUSY"; LAST_CPU_TOTAL="$CURRENT_CPU_TOTAL"
@@ -301,6 +407,7 @@ collect_locked() {
 
     local sample_start="$LAST_TS" should_sample=0
     add_month_delta "$current_month" "$elapsed" "$rx_delta" "$tx_delta" "$busy_delta" "$total_delta"
+    add_week_delta "$current_week" "$elapsed" "$rx_delta" "$tx_delta"
     (( elapsed <= MAX_SAMPLE_SECONDS )) && should_sample=1
     LAST_TS="$CURRENT_TS"; LAST_BOOT="$CURRENT_BOOT"; LAST_INTERFACE="$INTERFACE"
     LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"
@@ -362,6 +469,16 @@ format_month_message() {
             split(month, part, "-"); cpu=(total>0 ? busy*100/total : 0)
             printf "%s %d年%d月流量报告\n进站流量: %.2f TB\n出站流量: %.2f TB\n总流量: %.2f TB\n平均CPU利用率: %.0f%%", \
                 name, part[1], part[2], rx/1000000000000, tx/1000000000000, (rx+tx)/1000000000000, cpu
+        }
+    '
+}
+
+format_week_message() {
+    local rx="$1" tx="$2"
+    awk -v name="$SERVER_NAME" -v rx="$rx" -v tx="$tx" '
+        BEGIN {
+            printf "%s\n上一周的流量使用情况为：\n进站流量: %.2f TB\n出站流量: %.2f TB\n总流量: %.2f TB", \
+                name, rx/1000000000000, tx/1000000000000, (rx+tx)/1000000000000
         }
     '
 }
@@ -453,6 +570,25 @@ oldest_unsent_month() {
     printf '%s' "$oldest"
 }
 
+oldest_unsent_week() {
+    local current_week candidate week week_key current_key
+    local oldest="" oldest_key=0
+    current_week="$(date +%G-W%V)"; current_key="${current_week/-W/}"
+    for candidate in "$DATA_DIR"/week-????-W??.tsv; do
+        [[ -f "$candidate" ]] || continue
+        week="${candidate##*/week-}"; week="${week%.tsv}"
+        is_week_key "$week" || continue
+        week_key="${week/-W/}"
+        (( week_key < current_key )) || continue
+        [[ ! -e "${DATA_DIR}/sent-week-${week}" ]] || continue
+        if [[ -z "$oldest" ]] || (( week_key < oldest_key )); then
+            oldest="$week"; oldest_key="$week_key"
+        fi
+    done
+    [[ -n "$oldest" ]] || return 1
+    printf '%s' "$oldest"
+}
+
 run_monthly() {
     load_config; acquire_lock
     collect_locked >/dev/null
@@ -470,6 +606,25 @@ run_monthly() {
     send_message "$message"
     : > "$marker"; chmod 0600 "$marker"
     printf 'monthly: sent\n'
+}
+
+run_weekly() {
+    load_config; acquire_lock
+    collect_locked >/dev/null
+    local report_week archive marker rx tx seconds message
+    if ! report_week="$(oldest_unsent_week)"; then
+        printf 'weekly: nothing-pending\n'
+        return
+    fi
+    archive="${DATA_DIR}/week-${report_week}.tsv"; marker="${DATA_DIR}/sent-week-${report_week}"
+    read -r rx tx seconds < "$archive"
+    if ! is_uint "$rx" || ! is_uint "$tx" || ! is_uint "$seconds" || (( seconds == 0 )); then
+        fatal "周度统计文件格式异常。"
+    fi
+    message="$(format_week_message "$rx" "$tx")"
+    send_message "$message"
+    : > "$marker"; chmod 0600 "$marker"
+    printf 'weekly: sent\n'
 }
 
 run_test_message() {
@@ -500,12 +655,12 @@ run_status() {
     (( LAST_REPORT > 0 )) && last_report="$(date -d "@${LAST_REPORT}" '+%F %T %Z')"
     [[ -r "$SAMPLES_FILE" ]] && sample_count="$(wc -l < "$SAMPLES_FILE")"
     [[ -r "$STATE_FILE" ]] && state_size="$(wc -c < "$STATE_FILE")"
-    for timer in vps-monitor-{collect,report,monthly}.timer; do
+    for timer in vps-monitor-{collect,report,weekly,monthly}.timer; do
         if ! systemctl is-enabled --quiet "$timer" || ! systemctl is-active --quiet "$timer"; then
             timers="异常"
         fi
     done
-    for service in vps-monitor-{collect,report,monthly}.service; do
+    for service in vps-monitor-{collect,report,weekly,monthly}.service; do
         if systemctl is-failed --quiet "$service"; then
             timers="异常"
         fi
@@ -957,6 +1112,48 @@ Unit=vps-monitor-report.service
 [Install]
 WantedBy=timers.target
 EOF
+    cat > "${SYSTEMD_DIR}/vps-monitor-weekly.service" <<EOF
+[Unit]
+Description=Send previous calendar week VPS traffic report
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+ExecStart=${BIN_PATH} weekly
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=${DATA_DIR}
+TimeoutStartSec=4min
+Restart=on-failure
+RestartSec=30min
+EOF
+    cat > "${SYSTEMD_DIR}/vps-monitor-weekly.timer" <<EOF
+[Unit]
+Description=Send VPS weekly traffic report every Monday at noon
+[Timer]
+OnCalendar=Mon *-*-* 12:00:00
+Persistent=true
+AccuracySec=1min
+Unit=vps-monitor-weekly.service
+[Install]
+WantedBy=timers.target
+EOF
     cat > "${SYSTEMD_DIR}/vps-monitor-monthly.service" <<EOF
 [Unit]
 Description=Send previous calendar month VPS report
@@ -999,7 +1196,7 @@ Unit=vps-monitor-monthly.service
 [Install]
 WantedBy=timers.target
 EOF
-    chmod 0644 "${SYSTEMD_DIR}"/vps-monitor-{collect,report,monthly}.{service,timer}
+    chmod 0644 "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer}
 }
 
 install_script_source() {
@@ -1061,7 +1258,7 @@ install_app() {
             fatal "无法创建专用系统账户，安装已安全停止。"
         fi
     fi
-    systemctl stop vps-monitor-{collect,report,monthly}.{timer,service} >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly}.{timer,service} >/dev/null 2>&1 || true
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
     printf '%s' "$setup_token" > "${WORK_DIR}/token"
@@ -1078,9 +1275,9 @@ install_app() {
     install_login_alert_hook
     systemctl daemon-reload
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
-    systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null
+    systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null
     success "安装完成，Telegram 安全启动链接与 SSH 登录提醒已验证"
-    printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每月 1 日发送月报；SSH 登录成功时立即提醒。\n'
+    printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每周一中午发送周报，每月 1 日发送月报；SSH 登录成功时立即提醒。\n'
     printf '查看状态：sudo vps-monitor status\n查看日志：sudo journalctl -u "vps-monitor-*" --since today\n\n'
     warn "Token 与 UID 仅保存在受限配置文件中，日志不会输出这些信息。"
 }
@@ -1092,6 +1289,9 @@ apply_installed_update() {
     WORK_DIR="$(mktemp -d -t vps-monitor-update-apply.XXXXXXXX)"
     chmod 0700 "$WORK_DIR"
     trap cleanup_work_dir EXIT
+    [[ -e "${SYSTEMD_DIR}/vps-monitor-weekly.service" ]] && APPLY_UPDATE_WEEKLY_SERVICE_EXISTED=1
+    [[ -e "${SYSTEMD_DIR}/vps-monitor-weekly.timer" ]] && APPLY_UPDATE_WEEKLY_TIMER_EXISTED=1
+    APPLY_UPDATE_IN_PROGRESS=1
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
     chown root:"$SERVICE_USER" "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
@@ -1100,30 +1300,37 @@ apply_installed_update() {
     install_systemd_units
     install_login_alert_hook
     systemctl daemon-reload
-    systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null
+    systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null
+    APPLY_UPDATE_IN_PROGRESS=0
 }
 
 restore_update_backup() {
-    local backup_dir="$1" pam_line_was_present="$2" unit units_complete=1
+    local backup_dir="$1" pam_line_was_present="$2" unit component
+    local -a timers_to_enable=()
     install -o root -g root -m 0755 "${backup_dir}/TG-check-notify.sh" "$SCRIPT_PATH" || return 1
     if [[ -f "${backup_dir}/login-alert-hook" ]]; then
         install -o root -g root -m 0755 "${backup_dir}/login-alert-hook" "$LOGIN_HOOK_PATH" || return 1
     else
         rm -f -- "$LOGIN_HOOK_PATH" || return 1
     fi
-    for unit in vps-monitor-{collect,report,monthly}.{service,timer}; do
+    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer}; do
         if [[ -f "${backup_dir}/units/${unit}" ]]; then
             install -o root -g root -m 0644 "${backup_dir}/units/${unit}" "${SYSTEMD_DIR}/${unit}" || return 1
         else
             rm -f -- "${SYSTEMD_DIR}/${unit}" || return 1
-            units_complete=0
         fi
     done
     (( pam_line_was_present == 1 )) || remove_pam_login_line || return 1
     ln -sfn "$SCRIPT_PATH" "$BIN_PATH" || return 1
     systemctl daemon-reload || return 1
-    if (( units_complete == 1 )); then
-        systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null || return 1
+    for component in collect report weekly monthly; do
+        if [[ -f "${SYSTEMD_DIR}/vps-monitor-${component}.service" \
+            && -f "${SYSTEMD_DIR}/vps-monitor-${component}.timer" ]]; then
+            timers_to_enable+=("vps-monitor-${component}.timer")
+        fi
+    done
+    if (( ${#timers_to_enable[@]} > 0 )); then
+        systemctl enable --now "${timers_to_enable[@]}" >/dev/null || return 1
     fi
 }
 
@@ -1158,7 +1365,7 @@ run_update() {
     if [[ -f "$LOGIN_HOOK_PATH" ]]; then
         cp -p -- "$LOGIN_HOOK_PATH" "${backup_dir}/login-alert-hook"
     fi
-    for unit in vps-monitor-{collect,report,monthly}.{service,timer}; do
+    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer}; do
         if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
             cp -p -- "${SYSTEMD_DIR}/${unit}" "${backup_dir}/units/${unit}"
         fi
@@ -1167,17 +1374,17 @@ run_update() {
         pam_line_was_present=1
     fi
 
-    systemctl stop vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
     UPDATE_TIMERS_STOPPED=1
     local wait_deadline=$((SECONDS + 240)) active_service
     while :; do
         active_service=0
-        for unit in vps-monitor-{collect,report,monthly}.service; do
+        for unit in vps-monitor-{collect,report,weekly,monthly}.service; do
             systemctl is-active --quiet "$unit" && active_service=1
         done
         (( active_service == 0 )) && break
         if (( SECONDS >= wait_deadline )); then
-            systemctl enable --now vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
+            systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
             fatal "监控任务长时间未结束，更新已取消，现有程序未被修改。"
         fi
         sleep 1
@@ -1239,10 +1446,10 @@ uninstall_app() {
     pam_line="$(pam_login_line)"
 
     remove_pam_login_line || fatal "无法安全移除 SSH PAM 登录提醒，卸载已停止。"
-    systemctl disable --now vps-monitor-{collect,report,monthly}.timer >/dev/null 2>&1 || true
-    systemctl stop vps-monitor-{collect,report,monthly}.service >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly}.service >/dev/null 2>&1 || true
     systemctl stop 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
-    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,monthly}.{service,timer} "$BIN_PATH" || true
+    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer} "$BIN_PATH" || true
     rm -rf -- "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" || true
 
     if (( managed_account == 1 )); then
@@ -1259,15 +1466,15 @@ uninstall_app() {
     if ! systemctl daemon-reload; then
         leftovers+=("systemd 配置重新加载失败")
     fi
-    systemctl reset-failed vps-monitor-{collect,report,monthly}.{service,timer} >/dev/null 2>&1 || true
+    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly}.{service,timer} >/dev/null 2>&1 || true
     systemctl reset-failed 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
 
     for path in "$BIN_PATH" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" \
-        "${SYSTEMD_DIR}"/vps-monitor-{collect,report,monthly}.{service,timer} \
-        "${SYSTEMD_DIR}"/timers.target.wants/vps-monitor-{collect,report,monthly}.timer; do
+        "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer} \
+        "${SYSTEMD_DIR}"/timers.target.wants/vps-monitor-{collect,report,weekly,monthly}.timer; do
         [[ ! -e "$path" && ! -L "$path" ]] || leftovers+=("$path")
     done
-    for unit in vps-monitor-{collect,report,monthly}.{service,timer}; do
+    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer}; do
         systemctl is-active --quiet "$unit" && leftovers+=("仍在运行的 systemd 单元 ${unit}")
         systemctl is-enabled --quiet "$unit" && leftovers+=("仍然启用的 systemd 单元 ${unit}")
     done
@@ -1294,17 +1501,18 @@ uninstall_app() {
 }
 
 usage() {
-    printf '用法：vps-monitor {collect|report|monthly|test|status|rename|update|uninstall}\n'
+    printf '用法：vps-monitor {collect|report|weekly|monthly|test|status|rename|update|uninstall}\n'
 }
 
 main() {
     case "${1:-install}" in
-        collect|report|monthly|test|login-alert) run_as_service_user_if_needed "$@" ;;
+        collect|report|weekly|monthly|test|login-alert) run_as_service_user_if_needed "$@" ;;
     esac
     case "${1:-install}" in
         install) install_app ;;
         collect) run_collect ;;
         report) run_report ;;
+        weekly) run_weekly ;;
         monthly) run_monthly ;;
         test) run_test_message ;;
         login-alert) run_login_alert ;;

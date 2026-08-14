@@ -126,6 +126,10 @@ expected_month=$'测试服务器 2026年8月流量报告\n进站流量: 1.42 TB\
 actual_month="$(format_month_message 2026-08 1420000000000 1090000000000 29 100)"
 assert_equal "$expected_month" "$actual_month" "monthly message format"
 
+expected_week=$'测试服务器\n上一周的流量使用情况为：\n进站流量: 0.12 TB\n出站流量: 0.08 TB\n总流量: 0.20 TB'
+actual_week="$(format_week_message 120000000000 80000000000)"
+assert_equal "$expected_week" "$actual_week" "weekly message format"
+
 version_is_newer 1.5.0 1.4.9 || { printf 'FAIL: newer version was rejected\n' >&2; exit 1; }
 if version_is_newer 1.5.0 1.5.0 || version_is_newer 1.4.9 1.5.0; then
     printf 'FAIL: equal or older version was accepted as newer\n' >&2
@@ -256,6 +260,8 @@ printf 'month_rx\t$(touch %s)\nmonth_tx\t42\n' "$pwned" > "$STATE_FILE"
 load_state
 assert_equal "0" "$MONTH_RX" "invalid state rejected"
 assert_equal "42" "$MONTH_TX" "valid state accepted"
+assert_equal "" "$STATE_WEEK" "legacy state starts without weekly key"
+assert_equal "0" "$WEEK_RX" "legacy state starts with zero weekly rx"
 [[ ! -e "$pwned" ]] || { printf 'FAIL: state file was executed\n' >&2; exit 1; }
 
 STATE_MONTH="2026-07"
@@ -314,6 +320,124 @@ assert_equal "36000000000" "$MONTH_RX" "multi-month August rx"
 assert_equal "18000000000" "$MONTH_TX" "multi-month August tx"
 assert_equal "3600" "$MONTH_SECONDS" "multi-month August duration"
 
+STATE_MONTH="2026-05"
+MONTH_RX=100; MONTH_TX=200; MONTH_CPU_BUSY=10; MONTH_CPU_TOTAL=50; MONTH_SECONDS=60
+STATE_WEEK="2026-W22"
+WEEK_RX=100; WEEK_TX=200; WEEK_SECONDS=60
+LAST_TS="$(date -d '2026-05-31 23:55:00 UTC' +%s)"
+CURRENT_TS="$(date -d '2026-06-01 00:05:00 UTC' +%s)"
+add_month_delta 2026-06 600 6000 8000 300 600
+add_week_delta 2026-W23 600 6000 8000
+read -r archived_rx archived_tx _ _ archived_seconds < "${DATA_DIR}/month-2026-05.tsv"
+assert_equal "3100" "$archived_rx" "month-and-week boundary monthly rx"
+assert_equal "4200" "$archived_tx" "month-and-week boundary monthly tx"
+assert_equal "360" "$archived_seconds" "month-and-week boundary monthly duration"
+read -r archived_rx archived_tx archived_seconds < "${DATA_DIR}/week-2026-W22.tsv"
+assert_equal "3100" "$archived_rx" "month-and-week boundary weekly rx"
+assert_equal "4200" "$archived_tx" "month-and-week boundary weekly tx"
+assert_equal "360" "$archived_seconds" "month-and-week boundary weekly duration"
+assert_equal "2026-W23" "$STATE_WEEK" "new week selected"
+assert_equal "3000" "$WEEK_RX" "new week rx split"
+assert_equal "4000" "$WEEK_TX" "new week tx split"
+assert_equal "300" "$WEEK_SECONDS" "new week duration split"
+
+STATE_WEEK=""
+WEEK_RX=0; WEEK_TX=0; WEEK_SECONDS=0
+LAST_TS="$(date -d '2026-08-09 23:55:00 UTC' +%s)"
+CURRENT_TS="$(date -d '2026-08-10 00:05:00 UTC' +%s)"
+add_week_delta 2026-W33 600 6000 8000
+read -r archived_rx archived_tx archived_seconds < "${DATA_DIR}/week-2026-W32.tsv"
+assert_equal "3000" "$archived_rx" "first partial week archived rx"
+assert_equal "4000" "$archived_tx" "first partial week archived tx"
+assert_equal "300" "$archived_seconds" "first partial week duration"
+assert_equal "2026-W33" "$STATE_WEEK" "first partial week rolls forward"
+assert_equal "3000" "$WEEK_RX" "first current week rx"
+assert_equal "4000" "$WEEK_TX" "first current week tx"
+
+STATE_WEEK="2026-W53"
+WEEK_RX=0; WEEK_TX=0; WEEK_SECONDS=0
+LAST_TS="$(date -d '2027-01-03 23:00:00 UTC' +%s)"
+CURRENT_TS="$(date -d '2027-01-04 01:00:00 UTC' +%s)"
+add_week_delta 2027-W01 7200 72000 36000
+read -r archived_rx archived_tx archived_seconds < "${DATA_DIR}/week-2026-W53.tsv"
+assert_equal "36000" "$archived_rx" "ISO year boundary previous week rx"
+assert_equal "18000" "$archived_tx" "ISO year boundary previous week tx"
+assert_equal "3600" "$archived_seconds" "ISO year boundary previous week duration"
+assert_equal "2027-W01" "$STATE_WEEK" "ISO year boundary current week"
+assert_equal "36000" "$WEEK_RX" "ISO year boundary current rx"
+assert_equal "18000" "$WEEK_TX" "ISO year boundary current tx"
+
+STATE_WEEK="2026-W31"
+WEEK_RX=0; WEEK_TX=0; WEEK_SECONDS=0
+LAST_TS="$(date -d '2026-08-02 23:00:00 UTC' +%s)"
+CURRENT_TS="$(date -d '2026-08-17 01:00:00 UTC' +%s)"
+multi_week_elapsed=$((CURRENT_TS - LAST_TS))
+multi_week_rx=$((multi_week_elapsed * 10000000))
+multi_week_tx=$((multi_week_elapsed * 5000000))
+add_week_delta 2026-W34 "$multi_week_elapsed" "$multi_week_rx" "$multi_week_tx"
+read -r archived_rx archived_tx archived_seconds < "${DATA_DIR}/week-2026-W31.tsv"
+assert_equal "36000000000" "$archived_rx" "multi-week first rx without overflow"
+assert_equal "18000000000" "$archived_tx" "multi-week first tx without overflow"
+assert_equal "3600" "$archived_seconds" "multi-week first duration"
+for archived_week in 2026-W32 2026-W33; do
+    read -r archived_rx archived_tx archived_seconds < "${DATA_DIR}/week-${archived_week}.tsv"
+    assert_equal "6048000000000" "$archived_rx" "multi-week full rx ${archived_week}"
+    assert_equal "3024000000000" "$archived_tx" "multi-week full tx ${archived_week}"
+    assert_equal "604800" "$archived_seconds" "multi-week full duration ${archived_week}"
+done
+assert_equal "2026-W34" "$STATE_WEEK" "multi-week current week"
+assert_equal "36000000000" "$WEEK_RX" "multi-week current rx"
+assert_equal "18000000000" "$WEEK_TX" "multi-week current tx"
+assert_equal "3600" "$WEEK_SECONDS" "multi-week current duration"
+save_state
+STATE_WEEK=""; WEEK_RX=0; WEEK_TX=0; WEEK_SECONDS=0
+load_state
+assert_equal "2026-W34" "$STATE_WEEK" "weekly state survives reload"
+assert_equal "36000000000" "$WEEK_RX" "weekly rx survives reload"
+assert_equal "18000000000" "$WEEK_TX" "weekly tx survives reload"
+assert_equal "3600" "$WEEK_SECONDS" "weekly duration survives reload"
+
+empty_week_archive="${DATA_DIR}/week-2025-W01.tsv"
+rm -f -- "$empty_week_archive"
+STATE_WEEK="2025-W01"; WEEK_RX=0; WEEK_TX=0; WEEK_SECONDS=0
+archive_current_week
+[[ ! -e "$empty_week_archive" ]] \
+    || { printf 'FAIL: empty week created a false zero archive\n' >&2; exit 1; }
+
+weekly_queue="${TEST_DIR}/weekly-queue"
+mkdir -p "$weekly_queue"
+DATA_DIR="$weekly_queue"
+printf '1\t2\t60\n' > "${DATA_DIR}/week-2020-W02.tsv"
+printf '1\t2\t60\n' > "${DATA_DIR}/week-2020-W01.tsv"
+assert_equal "2020-W01" "$(oldest_unsent_week)" "oldest weekly report is retried first"
+: > "${DATA_DIR}/sent-week-2020-W01"
+assert_equal "2020-W02" "$(oldest_unsent_week)" "weekly queue advances after marker"
+
+test_weekly_delivery() (
+    DATA_DIR="${TEST_DIR}/weekly-delivery"
+    mkdir -p "$DATA_DIR"
+    printf '120000000000\t80000000000\t3600\n' > "${DATA_DIR}/week-2020-W01.tsv"
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced weekly command.
+    load_config() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced weekly command.
+    acquire_lock() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the sourced weekly command.
+    collect_locked() { :; }
+    # shellcheck disable=SC2317,SC2329 # Captures weekly Telegram delivery.
+    send_message() {
+        printf '%s' "$1" > "${DATA_DIR}/captured-message"
+        printf 'sent\n' >> "${DATA_DIR}/send-count"
+    }
+
+    assert_equal "weekly: sent" "$(run_weekly)" "weekly report delivery"
+    [[ -e "${DATA_DIR}/sent-week-2020-W01" ]] \
+        || { printf 'FAIL: successful weekly report did not create marker\n' >&2; exit 1; }
+    assert_equal "$expected_week" "$(<"${DATA_DIR}/captured-message")" "weekly delivered message"
+    assert_equal "weekly: nothing-pending" "$(run_weekly)" "weekly duplicate prevention"
+    assert_equal "1" "$(wc -l < "${DATA_DIR}/send-count")" "weekly send count"
+)
+(test_weekly_delivery)
+
 monthly_queue="${TEST_DIR}/monthly-queue"
 mkdir -p "$monthly_queue"
 DATA_DIR="$monthly_queue"
@@ -337,10 +461,31 @@ grep -Fxq 'Persistent=true' "${SYSTEMD_DIR}/vps-monitor-report.timer"
 grep -Fxq 'OnBootSec=10s' "${SYSTEMD_DIR}/vps-monitor-collect.timer"
 grep -Fxq 'StandardOutput=null' "${SYSTEMD_DIR}/vps-monitor-collect.service"
 grep -Fxq 'StandardError=journal' "${SYSTEMD_DIR}/vps-monitor-collect.service"
+grep -Fxq 'OnCalendar=Mon *-*-* 12:00:00' "${SYSTEMD_DIR}/vps-monitor-weekly.timer"
+grep -Fxq 'Persistent=true' "${SYSTEMD_DIR}/vps-monitor-weekly.timer"
+grep -Fxq 'ExecStart=/bin/true weekly' "${SYSTEMD_DIR}/vps-monitor-weekly.service"
+grep -Fxq 'NoNewPrivileges=yes' "${SYSTEMD_DIR}/vps-monitor-weekly.service"
+grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' "${SYSTEMD_DIR}/vps-monitor-weekly.service"
 grep -Fxq 'OnCalendar=*-*-* 00:05:00' "${SYSTEMD_DIR}/vps-monitor-monthly.timer"
 if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify "${SYSTEMD_DIR}"/*.service "${SYSTEMD_DIR}"/*.timer
 fi
+
+(
+    SYSTEMD_DIR="${TEST_DIR}/failed-v162-apply"
+    APPLY_UPDATE_WEEKLY_SERVICE_EXISTED=0
+    APPLY_UPDATE_WEEKLY_TIMER_EXISTED=0
+    mkdir -p "$SYSTEMD_DIR"
+    : > "${SYSTEMD_DIR}/vps-monitor-weekly.service"
+    : > "${SYSTEMD_DIR}/vps-monitor-weekly.timer"
+    # shellcheck disable=SC2317,SC2329 # Called by failed apply cleanup.
+    systemctl() { return 0; }
+    cleanup_failed_apply_units
+    for unit_name in vps-monitor-weekly.{service,timer}; do
+        [[ ! -e "${SYSTEMD_DIR}/${unit_name}" ]] \
+            || { printf 'FAIL: v1.6.2 failed apply left %s\n' "$unit_name" >&2; exit 1; }
+    done
+)
 
 if ! (
     # shellcheck disable=SC2317,SC2329 # Called by the sourced account ownership check.
@@ -432,6 +577,10 @@ fi
         grep -Fqx "old unit ${unit_name}" "${SYSTEMD_DIR}/${unit_name}" \
             || { printf 'FAIL: failed update did not restore %s\n' "$unit_name" >&2; exit 1; }
     done
+    for unit_name in vps-monitor-weekly.{service,timer}; do
+        [[ ! -e "${SYSTEMD_DIR}/${unit_name}" ]] \
+            || { printf 'FAIL: failed pre-weekly update left %s\n' "$unit_name" >&2; exit 1; }
+    done
 )
 
 (
@@ -450,7 +599,7 @@ fi
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         '# VPS_TELEGRAM_MONITOR_SCRIPT=1' \
-        'VERSION="1.6.2"' \
+        'VERSION="1.7.0"' \
         'if [[ "${1:-}" == "__apply-update" ]]; then : > "$REPAIR_HOOK"; fi' > "$candidate"
     cp -- "$candidate" "$SCRIPT_PATH"
     chmod 0700 "$SCRIPT_PATH" "$candidate"
@@ -523,10 +672,10 @@ fi
         "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
     : > "$BIN_PATH"; : > "$LOGIN_HOOK_PATH"; : > "$PAM_SSHD_FILE"
     ensure_pam_login_line
-    for unit_name in vps-monitor-{collect,report,monthly}.{service,timer}; do
+    for unit_name in vps-monitor-{collect,report,weekly,monthly}.{service,timer}; do
         : > "${SYSTEMD_DIR}/${unit_name}"
     done
-    for timer_name in vps-monitor-{collect,report,monthly}.timer; do
+    for timer_name in vps-monitor-{collect,report,weekly,monthly}.timer; do
         : > "${SYSTEMD_DIR}/timers.target.wants/${timer_name}"
     done
 
