@@ -135,13 +135,12 @@ assert_equal "$expected_two_hour" "$actual_two_hour" "two-hour message format"
 partial_coverage_message="$(format_two_hour_message 64800000000 32400000000 29 100 6480 1000000000000)"
 grep -Fqx '进站速度: 10.00 MB/s' <<< "$partial_coverage_message"
 grep -Fqx '出站速度: 5.00 MB/s' <<< "$partial_coverage_message"
-
-forecast_now="$(date -d '2026-08-16 00:00:00 UTC' +%s)"
-forecast_seconds=$((15 * 86400))
-forecast_value="$(calculate_month_forecast "$forecast_now" 15000000000000 "$forecast_seconds")"
-assert_equal "31000000000000" "$forecast_value" "month-end forecast"
-if calculate_month_forecast "$forecast_now" 1000000000 60 >/dev/null; then
-    printf 'FAIL: forecast accepted insufficient observation time\n' >&2
+if grep -Fq 'protect_content' "${ROOT_DIR}/TG-check-notify.sh"; then
+    printf 'FAIL: Telegram messages are still protected from copying or forwarding\n' >&2
+    exit 1
+fi
+if grep -Fq '月底预计' "${ROOT_DIR}/TG-check-notify.sh"; then
+    printf 'FAIL: month-end forecast text still exists\n' >&2
     exit 1
 fi
 
@@ -283,6 +282,7 @@ test_status() {
     pam_login_line > "$PAM_SSHD_FILE"
     status_output="$(run_status)"
     grep -Fqx '定时任务: 正常' <<< "$status_output"
+    grep -Fqx '自动更新: 正常' <<< "$status_output"
     grep -Fqx '登录提醒: 正常' <<< "$status_output"
     # shellcheck disable=SC2317,SC2329 # Replaces the healthy state for the stale-state check.
     load_state() { LAST_TS=0; LAST_REPORT=0; }
@@ -561,6 +561,15 @@ grep -Fxq 'OnCalendar=*-*-* 00:05:00' "${SYSTEMD_DIR}/vps-monitor-monthly.timer"
 grep -Fxq 'ExecStart=/bin/true boot-alert' "${SYSTEMD_DIR}/vps-monitor-boot.service"
 grep -Fxq 'WantedBy=multi-user.target' "${SYSTEMD_DIR}/vps-monitor-boot.service"
 grep -Fxq 'Restart=on-failure' "${SYSTEMD_DIR}/vps-monitor-boot.service"
+grep -Fxq 'ExecStart=/bin/true auto-update' "${SYSTEMD_DIR}/vps-monitor-auto-update.service"
+grep -Fxq 'OnCalendar=*-*-* 04:15:00' "${SYSTEMD_DIR}/vps-monitor-auto-update.timer"
+grep -Fxq 'RandomizedDelaySec=30min' "${SYSTEMD_DIR}/vps-monitor-auto-update.timer"
+grep -Fxq 'Persistent=true' "${SYSTEMD_DIR}/vps-monitor-auto-update.timer"
+grep -Fxq 'ProtectSystem=strict' "${SYSTEMD_DIR}/vps-monitor-auto-update.service"
+if grep -Eq '^(User|Group)=' "${SYSTEMD_DIR}/vps-monitor-auto-update.service"; then
+    printf 'FAIL: automatic updater is not running as root\n' >&2
+    exit 1
+fi
 if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify "${SYSTEMD_DIR}"/*.service "${SYSTEMD_DIR}"/*.timer
 fi
@@ -570,17 +579,22 @@ fi
     APPLY_UPDATE_WEEKLY_SERVICE_EXISTED=0
     APPLY_UPDATE_WEEKLY_TIMER_EXISTED=0
     APPLY_UPDATE_BOOT_SERVICE_EXISTED=0
+    APPLY_UPDATE_AUTO_SERVICE_EXISTED=0
+    APPLY_UPDATE_AUTO_TIMER_EXISTED=0
     APPLY_UPDATE_MANAGED_MARKER_EXISTED=0
     mkdir -p "$SYSTEMD_DIR"
     : > "${SYSTEMD_DIR}/vps-monitor-weekly.service"
     : > "${SYSTEMD_DIR}/vps-monitor-weekly.timer"
     : > "${SYSTEMD_DIR}/vps-monitor-boot.service"
+    : > "${SYSTEMD_DIR}/vps-monitor-auto-update.service"
+    : > "${SYSTEMD_DIR}/vps-monitor-auto-update.timer"
     MANAGED_MARKER_PATH="${SYSTEMD_DIR}/managed-marker"
     : > "$MANAGED_MARKER_PATH"
     # shellcheck disable=SC2317,SC2329 # Called by failed apply cleanup.
     systemctl() { return 0; }
     cleanup_failed_apply_units
-    for unit_name in vps-monitor-weekly.{service,timer} vps-monitor-boot.service; do
+    for unit_name in vps-monitor-weekly.{service,timer} vps-monitor-boot.service \
+        vps-monitor-auto-update.{service,timer}; do
         [[ ! -e "${SYSTEMD_DIR}/${unit_name}" ]] \
             || { printf 'FAIL: v1.6.2 failed apply left %s\n' "$unit_name" >&2; exit 1; }
     done
@@ -714,7 +728,8 @@ fi
         grep -Fqx "old unit ${unit_name}" "${SYSTEMD_DIR}/${unit_name}" \
             || { printf 'FAIL: failed update did not restore %s\n' "$unit_name" >&2; exit 1; }
     done
-    for unit_name in vps-monitor-weekly.{service,timer} vps-monitor-boot.service; do
+    for unit_name in vps-monitor-weekly.{service,timer} vps-monitor-boot.service \
+        vps-monitor-auto-update.{service,timer}; do
         [[ ! -e "${SYSTEMD_DIR}/${unit_name}" ]] \
             || { printf 'FAIL: failed pre-weekly update left %s\n' "$unit_name" >&2; exit 1; }
     done
@@ -736,7 +751,7 @@ fi
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         '# VPS_TELEGRAM_MONITOR_SCRIPT=1' \
-        'VERSION="1.8.0"' \
+        'VERSION="1.9.0"' \
         'if [[ "${1:-}" == "__apply-update" ]]; then : > "$REPAIR_HOOK"; fi' > "$candidate"
     cp -- "$candidate" "$SCRIPT_PATH"
     chmod 0700 "$SCRIPT_PATH" "$candidate"
@@ -776,6 +791,39 @@ fi
     run_update >/dev/null
     [[ -f "$LOGIN_HOOK_PATH" ]] \
         || { printf 'FAIL: same-version update did not repair a missing login hook\n' >&2; exit 1; }
+)
+
+(
+    AUTO_ROOT="${TEST_DIR}/automatic-same-version"
+    SCRIPT_PATH="${AUTO_ROOT}/installed.sh"
+    UPDATE_LOCK_FILE="${AUTO_ROOT}/update.lock"
+    candidate="${AUTO_ROOT}/candidate.sh"
+    mkdir -p "$AUTO_ROOT"
+    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.9.0"\n' > "$SCRIPT_PATH"
+    cp -- "$SCRIPT_PATH" "$candidate"
+    chmod 0700 "$SCRIPT_PATH" "$candidate"
+
+    # shellcheck disable=SC2317,SC2329 # Called by the automatic updater.
+    require_root() { :; }
+    # shellcheck disable=SC2317,SC2329 # Called by the automatic updater.
+    verify_supported_os() { :; }
+    # shellcheck disable=SC2317,SC2329 # Confirms unattended updates never invoke apt repair.
+    dependencies_ready() { return 0; }
+    # shellcheck disable=SC2317,SC2329 # Must not be called in automatic mode.
+    ensure_dependencies() { : > "${AUTO_ROOT}/unexpected-dependency-repair"; }
+    # shellcheck disable=SC2317,SC2329 # Called by the automatic updater.
+    is_managed_service_account() { return 0; }
+    # shellcheck disable=SC2317,SC2329 # Called by the automatic updater.
+    load_config() { :; }
+    # shellcheck disable=SC2317,SC2329 # Supplies the same verified version.
+    download_verified_main() { command cp -- "$candidate" "$1"; }
+    # shellcheck disable=SC2317,SC2329 # Called by the automatic updater.
+    flock() { return 0; }
+
+    auto_output="$(run_update automatic)"
+    grep -Fq '未重复安装' <<< "$auto_output"
+    [[ ! -e "${AUTO_ROOT}/unexpected-dependency-repair" ]] \
+        || { printf 'FAIL: automatic update tried to install dependencies\n' >&2; exit 1; }
 )
 
 (
@@ -845,14 +893,14 @@ fi
 
     mkdir -p "$SYSTEMD_DIR/timers.target.wants" "$(dirname -- "$BIN_PATH")" \
         "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
-    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.8.0"\n' > "$SCRIPT_PATH"
+    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.9.0"\n' > "$SCRIPT_PATH"
     : > "$LOGIN_HOOK_PATH"; : > "$PAM_SSHD_FILE"; : > "$UPDATE_LOCK_FILE"
     ensure_pam_login_line
-    for unit_name in vps-monitor-{collect,report,weekly,monthly}.{service,timer}; do
+    for unit_name in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer}; do
         : > "${SYSTEMD_DIR}/${unit_name}"
     done
     : > "${SYSTEMD_DIR}/vps-monitor-boot.service"
-    for timer_name in vps-monitor-{collect,report,weekly,monthly}.timer; do
+    for timer_name in vps-monitor-{collect,report,weekly,monthly,auto-update}.timer; do
         : > "${SYSTEMD_DIR}/timers.target.wants/${timer_name}"
     done
 

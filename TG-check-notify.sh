@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.8.0"
+VERSION="1.9.0"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -36,7 +36,6 @@ WINDOW_SECONDS=7200
 MIN_COVERAGE_SECONDS=6480
 MAX_SAMPLE_SECONDS=900
 SAMPLE_RETENTION_SECONDS=21600
-FORECAST_MIN_SECONDS=21600
 
 TOKEN=""
 CHAT_ID=""
@@ -68,6 +67,8 @@ APPLY_UPDATE_IN_PROGRESS=0
 APPLY_UPDATE_WEEKLY_SERVICE_EXISTED=0
 APPLY_UPDATE_WEEKLY_TIMER_EXISTED=0
 APPLY_UPDATE_BOOT_SERVICE_EXISTED=0
+APPLY_UPDATE_AUTO_SERVICE_EXISTED=0
+APPLY_UPDATE_AUTO_TIMER_EXISTED=0
 APPLY_UPDATE_MANAGED_MARKER_EXISTED=0
 INSTALL_IN_PROGRESS=0
 INSTALL_CREATED_SERVICE_ACCOUNT=0
@@ -99,6 +100,7 @@ cleanup_failed_apply_units() {
     systemctl disable --now vps-monitor-weekly.timer >/dev/null 2>&1 || true
     systemctl stop vps-monitor-weekly.service >/dev/null 2>&1 || true
     systemctl disable --now vps-monitor-boot.service >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-auto-update.timer >/dev/null 2>&1 || true
     if (( APPLY_UPDATE_WEEKLY_SERVICE_EXISTED == 0 )); then
         rm -f -- "${SYSTEMD_DIR}/vps-monitor-weekly.service" || true
     fi
@@ -108,6 +110,12 @@ cleanup_failed_apply_units() {
     if (( APPLY_UPDATE_BOOT_SERVICE_EXISTED == 0 )); then
         rm -f -- "${SYSTEMD_DIR}/vps-monitor-boot.service" || true
     fi
+    if (( APPLY_UPDATE_AUTO_SERVICE_EXISTED == 0 )); then
+        rm -f -- "${SYSTEMD_DIR}/vps-monitor-auto-update.service" || true
+    fi
+    if (( APPLY_UPDATE_AUTO_TIMER_EXISTED == 0 )); then
+        rm -f -- "${SYSTEMD_DIR}/vps-monitor-auto-update.timer" || true
+    fi
     if (( APPLY_UPDATE_MANAGED_MARKER_EXISTED == 0 )); then
         rm -f -- "$MANAGED_MARKER_PATH" || true
     fi
@@ -115,11 +123,11 @@ cleanup_failed_apply_units() {
 }
 
 cleanup_failed_install() {
-    systemctl disable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
     systemctl disable --now vps-monitor-boot.service >/dev/null 2>&1 || true
-    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot}.service >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot,auto-update}.service >/dev/null 2>&1 || true
     remove_pam_login_line >/dev/null 2>&1 || true
-    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer} \
+    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} \
         "${SYSTEMD_DIR}/vps-monitor-boot.service" "$BIN_PATH" "$UPDATE_LOCK_FILE" || true
     rm -rf -- "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" || true
     if (( INSTALL_CREATED_SERVICE_ACCOUNT == 1 )); then
@@ -139,7 +147,7 @@ cleanup_work_dir() {
         cleanup_failed_apply_units
     fi
     if (( UPDATE_TIMERS_STOPPED == 1 )) && (( EUID == 0 )) && command -v systemctl >/dev/null; then
-        systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+        systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
     fi
     if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
         rm -rf -- "$WORK_DIR"
@@ -504,14 +512,13 @@ calculate_window() {
 }
 
 format_two_hour_message() {
-    local rx="$1" tx="$2" busy="$3" total="$4" coverage="$5" month_total="$6" forecast="${7:-}"
+    local rx="$1" tx="$2" busy="$3" total="$4" coverage="$5" month_total="$6"
     awk -v name="$SERVER_NAME" -v rx="$rx" -v tx="$tx" -v busy="$busy" -v total="$total" \
-        -v coverage="$coverage" -v month_total="$month_total" -v forecast="$forecast" '
+        -v coverage="$coverage" -v month_total="$month_total" '
         BEGIN {
             cpu=(total>0 ? busy*100/total : 0)
             printf "%s\n进站速度: %.2f MB/s\n出站速度: %.2f MB/s\n总流量: %.2f TB\nCPU利用率: %.0f%%", \
                 name, rx/coverage/1000000, tx/coverage/1000000, month_total/1000000000000, cpu
-            if (forecast != "") printf "\n月底预计总流量: %.2f TB", forecast/1000000000000
         }
     '
 }
@@ -524,22 +531,6 @@ format_month_message() {
             printf "%s %d年%d月流量报告\n进站流量: %.2f TB\n出站流量: %.2f TB\n总流量: %.2f TB\n平均CPU利用率: %.0f%%", \
                 name, part[1], part[2], rx/1000000000000, tx/1000000000000, (rx+tx)/1000000000000, cpu
         }
-    '
-}
-
-calculate_month_forecast() {
-    local now="$1" month_total="$2" observed_seconds="$3" current_month next_month month_end remaining
-    if ! is_uint "$now" || ! is_uint "$month_total" || ! is_uint "$observed_seconds" \
-        || (( observed_seconds < FORECAST_MIN_SECONDS )); then
-        return 1
-    fi
-    current_month="$(date -d "@${now}" +%Y-%m)" || return 1
-    next_month="$(date -d "${current_month}-01 +1 month" +%Y-%m)" || return 1
-    month_end="$(date -d "${next_month}-01 00:00:00" +%s)" || return 1
-    is_uint "$month_end" && (( month_end > now )) || return 1
-    remaining=$((month_end - now))
-    awk -v total="$month_total" -v observed="$observed_seconds" -v remaining="$remaining" '
-        BEGIN { printf "%.0f", total + total * remaining / observed }
     '
 }
 
@@ -635,8 +626,7 @@ send_message() {
         "output = \"${response_file}\"" \
         "data-urlencode = \"chat_id=${CHAT_ID}\"" \
         "data-urlencode = \"text@${message_file}\"" \
-        'data = "disable_web_page_preview=true"' \
-        'data = "protect_content=true"' > "$curl_config"
+        'data = "disable_web_page_preview=true"' > "$curl_config"
     chmod 0600 "$curl_config" "$message_file"
 
     for attempt in 1 2 3 4; do
@@ -668,7 +658,7 @@ run_report() {
     acquire_lock || fatal "统计任务繁忙，本次两小时汇报将由 systemd 自动重试。"
     collect_locked >/dev/null
     load_state
-    local now rx tx busy total coverage message month_total forecast=""
+    local now rx tx busy total coverage message month_total
     now="$(date +%s)"
     if (( LAST_REPORT > 0 && now - LAST_REPORT < 6480 )); then
         printf 'report: duplicate-skipped\n'
@@ -680,8 +670,7 @@ run_report() {
         return
     fi
     month_total=$((MONTH_RX + MONTH_TX))
-    forecast="$(calculate_month_forecast "$now" "$month_total" "$MONTH_SECONDS" || true)"
-    message="$(format_two_hour_message "$rx" "$tx" "$busy" "$total" "$coverage" "$month_total" "$forecast")"
+    message="$(format_two_hour_message "$rx" "$tx" "$busy" "$total" "$coverage" "$month_total")"
     send_message "$message"
     LAST_REPORT="$now"; save_state
     printf 'report: sent\n'
@@ -832,8 +821,8 @@ run_status() {
     require_root
     load_config; load_state
     local last_sample="暂无" last_report="暂无" sample_count=0 state_size=0 now
-    local login_alert="异常" boot_alert="正常" timers="正常" timer service service_result
-    local month_total week_total forecast="数据不足" current_month current_week candidate key
+    local login_alert="异常" boot_alert="正常" auto_update="正常" timers="正常" timer service service_result
+    local month_total week_total current_month current_week candidate key
     local pending_months=0 pending_weeks=0 timezone
     now="$(date +%s)"
     current_month="$(date +%Y-%m)"; current_week="$(date +%G-W%V)"; timezone="$(date +%Z)"
@@ -857,6 +846,13 @@ run_status() {
         || systemctl is-failed --quiet vps-monitor-boot.service; then
         boot_alert="异常"
     fi
+    if ! systemctl is-enabled --quiet vps-monitor-auto-update.timer \
+        || ! systemctl is-active --quiet vps-monitor-auto-update.timer \
+        || systemctl is-failed --quiet vps-monitor-auto-update.service; then
+        auto_update="异常"
+    fi
+    service_result="$(systemctl show --property=Result --value vps-monitor-auto-update.service 2>/dev/null || printf 'unknown')"
+    [[ -z "$service_result" || "$service_result" == success ]] || auto_update="异常"
     if (( LAST_TS == 0 || LAST_TS > now + 300 || now - LAST_TS > MAX_SAMPLE_SECONDS )); then
         timers="异常"
     fi
@@ -866,8 +862,6 @@ run_status() {
         login_alert="正常"
     fi
     month_total=$((MONTH_RX + MONTH_TX)); week_total=$((WEEK_RX + WEEK_TX))
-    forecast="$(calculate_month_forecast "$now" "$month_total" "$MONTH_SECONDS" 2>/dev/null || printf '数据不足')"
-    [[ "$forecast" == "数据不足" ]] || forecast="$(awk -v value="$forecast" 'BEGIN { printf "%.2f TB", value/1000000000000 }')"
     for candidate in "$DATA_DIR"/month-????-??.tsv; do
         [[ -f "$candidate" ]] || continue
         key="${candidate##*/month-}"; key="${key%.tsv}"
@@ -880,12 +874,12 @@ run_status() {
         is_week_key "$key" || continue
         [[ "$key" < "$current_week" && ! -e "${DATA_DIR}/sent-week-${key}" ]] && pending_weeks=$((pending_weeks + 1))
     done
-    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n本地时区: %s\n定时任务: %s\n登录提醒: %s\n开机提醒: %s\n最近采样: %s\n最近汇报: %s\n本周流量: %.2f TB\n本月流量: %.2f TB\n月底预计: %s\n待发周报: %s 条\n待发月报: %s 条\n短期样本: %s 条\n状态文件: %s 字节\n' \
-        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$timezone" "$timers" "$login_alert" "$boot_alert" \
+    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n本地时区: %s\n定时任务: %s\n自动更新: %s\n登录提醒: %s\n开机提醒: %s\n最近采样: %s\n最近汇报: %s\n本周流量: %.2f TB\n本月流量: %.2f TB\n待发周报: %s 条\n待发月报: %s 条\n短期样本: %s 条\n状态文件: %s 字节\n' \
+        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$timezone" "$timers" "$auto_update" "$login_alert" "$boot_alert" \
         "$last_sample" "$last_report" \
         "$(awk -v value="$week_total" 'BEGIN { printf "%.2f", value/1000000000000 }')" \
         "$(awk -v value="$month_total" 'BEGIN { printf "%.2f", value/1000000000000 }')" \
-        "$forecast" "$pending_weeks" "$pending_months" "$sample_count" "$state_size"
+        "$pending_weeks" "$pending_months" "$sample_count" "$state_size"
 }
 
 setup_api_call() {
@@ -1178,20 +1172,24 @@ verify_supported_os() {
 }
 
 ensure_dependencies() {
-    local missing=0 command_name
-    for command_name in curl ip flock python3 awk getent groupadd useradd runuser systemd-run sha256sum tar; do
-        command -v "$command_name" >/dev/null || missing=1
-    done
-    if ! dpkg-query -W -f='${Status}' libpam-modules 2>/dev/null | grep -Fq 'install ok installed'; then
-        missing=1
+    if dependencies_ready; then
+        success "基础组件已就绪（运行时无第三方库）"
+        return
     fi
-    if (( missing == 1 )); then
-        info "正在安装系统基础组件……"
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq
-        apt-get install -y -qq bash curl ca-certificates iproute2 util-linux python3 gawk passwd libpam-modules tar
-    fi
+    info "正在安装系统基础组件……"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq bash curl ca-certificates iproute2 util-linux python3 gawk passwd libpam-modules tar
+    dependencies_ready || fatal "基础组件安装后仍不完整。"
     success "基础组件已就绪（运行时无第三方库）"
+}
+
+dependencies_ready() {
+    local command_name
+    for command_name in curl ip flock python3 awk getent groupadd useradd runuser systemd-run sha256sum tar; do
+        command -v "$command_name" >/dev/null || return 1
+    done
+    dpkg-query -W -f='${Status}' libpam-modules 2>/dev/null | grep -Fq 'install ok installed'
 }
 
 script_version() {
@@ -1455,7 +1453,50 @@ RestartSec=5min
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 0644 "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer}
+    cat > "${SYSTEMD_DIR}/vps-monitor-auto-update.service" <<EOF
+[Unit]
+Description=Safely update VPS Monitor from GitHub
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=6h
+StartLimitBurst=3
+[Service]
+Type=oneshot
+ExecStart=${BIN_PATH} auto-update
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=${INSTALL_DIR} /usr/local/bin ${CONFIG_DIR} ${DATA_DIR} ${SYSTEMD_DIR} ${PAM_SSHD_FILE%/*} /run/lock
+TimeoutStartSec=10min
+Restart=on-failure
+RestartSec=30min
+EOF
+    cat > "${SYSTEMD_DIR}/vps-monitor-auto-update.timer" <<EOF
+[Unit]
+Description=Check GitHub daily for VPS Monitor updates
+[Timer]
+OnCalendar=*-*-* 04:15:00
+RandomizedDelaySec=30min
+Persistent=true
+AccuracySec=5min
+Unit=vps-monitor-auto-update.service
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 0644 "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer}
     chmod 0644 "${SYSTEMD_DIR}/vps-monitor-boot.service"
 }
 
@@ -1473,7 +1514,7 @@ ensure_bin_link() {
 
 assert_fresh_install_targets() {
     local unit
-    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer} vps-monitor-boot.service; do
+    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} vps-monitor-boot.service; do
         [[ ! -e "${SYSTEMD_DIR}/${unit}" && ! -L "${SYSTEMD_DIR}/${unit}" ]] \
             || fatal "检测到同名 systemd 单元 ${unit}，为避免影响原有服务，安装已停止。"
     done
@@ -1549,7 +1590,7 @@ install_app() {
         fatal "无法创建专用系统账户，安装将自动回滚。"
     fi
     INSTALL_CREATED_SERVICE_ACCOUNT=1
-    systemctl stop vps-monitor-{collect,report,weekly,monthly}.{timer,service} >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,auto-update}.{timer,service} >/dev/null 2>&1 || true
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
     printf '%s' "$setup_token" > "${WORK_DIR}/token"
@@ -1567,11 +1608,11 @@ install_app() {
     systemctl daemon-reload
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
-    systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null
+    systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null
     systemctl enable vps-monitor-boot.service >/dev/null
     INSTALL_IN_PROGRESS=0
     success "安装完成，Telegram 安全启动链接与 SSH 登录提醒已验证"
-    printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报并预测月底流量，每周一发送带环比的周报，每月发送月报；VPS 重启恢复和 SSH 登录成功时立即提醒。\n'
+    printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每周一发送带环比的周报，每月发送月报；每天安全检查 GitHub 更新，VPS 重启恢复和 SSH 登录成功时立即提醒。\n'
     printf '查看状态：sudo vps-monitor status\n查看日志：sudo journalctl -u "vps-monitor-*" --since today\n\n'
     warn "Token 与 UID 仅保存在受限配置文件中，日志不会输出这些信息。"
 }
@@ -1586,6 +1627,8 @@ apply_installed_update() {
     [[ -e "${SYSTEMD_DIR}/vps-monitor-weekly.service" ]] && APPLY_UPDATE_WEEKLY_SERVICE_EXISTED=1
     [[ -e "${SYSTEMD_DIR}/vps-monitor-weekly.timer" ]] && APPLY_UPDATE_WEEKLY_TIMER_EXISTED=1
     [[ -e "${SYSTEMD_DIR}/vps-monitor-boot.service" ]] && APPLY_UPDATE_BOOT_SERVICE_EXISTED=1
+    [[ -e "${SYSTEMD_DIR}/vps-monitor-auto-update.service" ]] && APPLY_UPDATE_AUTO_SERVICE_EXISTED=1
+    [[ -e "${SYSTEMD_DIR}/vps-monitor-auto-update.timer" ]] && APPLY_UPDATE_AUTO_TIMER_EXISTED=1
     [[ -e "$MANAGED_MARKER_PATH" ]] && APPLY_UPDATE_MANAGED_MARKER_EXISTED=1
     APPLY_UPDATE_IN_PROGRESS=1
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
@@ -1599,7 +1642,7 @@ apply_installed_update() {
     install_login_alert_hook
     systemctl daemon-reload
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
-    systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null
+    systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null
     systemctl enable vps-monitor-boot.service >/dev/null
     APPLY_UPDATE_IN_PROGRESS=0
 }
@@ -1613,7 +1656,7 @@ restore_update_backup() {
     else
         rm -f -- "$LOGIN_HOOK_PATH" || return 1
     fi
-    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer} vps-monitor-boot.service; do
+    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} vps-monitor-boot.service; do
         if [[ -f "${backup_dir}/units/${unit}" ]]; then
             install -o root -g root -m 0644 "${backup_dir}/units/${unit}" "${SYSTEMD_DIR}/${unit}" || return 1
         else
@@ -1626,7 +1669,7 @@ restore_update_backup() {
     fi
     ln -sfn "$SCRIPT_PATH" "$BIN_PATH" || return 1
     systemctl daemon-reload || return 1
-    for component in collect report weekly monthly; do
+    for component in collect report weekly monthly auto-update; do
         if [[ -f "${SYSTEMD_DIR}/vps-monitor-${component}.service" \
             && -f "${SYSTEMD_DIR}/vps-monitor-${component}.timer" ]]; then
             timers_to_enable+=("vps-monitor-${component}.timer")
@@ -1641,7 +1684,18 @@ restore_update_backup() {
 }
 
 run_update() {
-    require_root; verify_supported_os; ensure_dependencies
+    local mode="${1:-manual}" automatic=0
+    case "$mode" in
+        manual) ;;
+        automatic) automatic=1 ;;
+        *) fatal "更新模式无效。" ;;
+    esac
+    require_root; verify_supported_os
+    if (( automatic == 1 )); then
+        dependencies_ready || fatal "自动更新所需的基础组件不完整，请运行 sudo vps-monitor doctor。"
+    else
+        ensure_dependencies
+    fi
     exec 8>"$UPDATE_LOCK_FILE"
     flock -n 8 || fatal "另一个更新任务正在运行，请稍后再试。"
     [[ -f "$SCRIPT_PATH" && -x "$SCRIPT_PATH" ]] \
@@ -1665,13 +1719,17 @@ run_update() {
         version_is_newer "$remote_version" "$installed_version" \
             || fatal "主版本 v${remote_version} 低于当前版本 v${installed_version}，已拒绝自动降级。"
     fi
+    if (( automatic == 1 && same_version == 1 )); then
+        success "自动检查完成：当前已是最新版 v${installed_version}，未重复安装。"
+        return
+    fi
 
     mkdir -p "${backup_dir}/units"
     cp -p -- "$SCRIPT_PATH" "${backup_dir}/TG-check-notify.sh"
     if [[ -f "$LOGIN_HOOK_PATH" ]]; then
         cp -p -- "$LOGIN_HOOK_PATH" "${backup_dir}/login-alert-hook"
     fi
-    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer} vps-monitor-boot.service; do
+    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} vps-monitor-boot.service; do
         if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
             cp -p -- "${SYSTEMD_DIR}/${unit}" "${backup_dir}/units/${unit}"
         fi
@@ -1680,7 +1738,7 @@ run_update() {
         pam_line_was_present=1
     fi
 
-    systemctl stop vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
     UPDATE_TIMERS_STOPPED=1
     local wait_deadline=$((SECONDS + 240)) active_service
     while :; do
@@ -1690,7 +1748,7 @@ run_update() {
         done
         (( active_service == 0 )) && break
         if (( SECONDS >= wait_deadline )); then
-            systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+            systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
             fatal "监控任务长时间未结束，更新已取消，现有程序未被修改。"
         fi
         sleep 1
@@ -1806,7 +1864,7 @@ doctor_app() {
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
     load_and_repair_config_for_doctor
 
-    systemctl stop vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
     UPDATE_TIMERS_STOPPED=1
     local deadline=$((SECONDS + 240)) unit active
     while :; do
@@ -1833,9 +1891,9 @@ doctor_app() {
     systemctl daemon-reload
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
-    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly,boot}.service \
-        vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
-    systemctl enable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null
+    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly,boot,auto-update}.service \
+        vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
+    systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null
     systemctl enable vps-monitor-boot.service >/dev/null
     UPDATE_TIMERS_STOPPED=0
 
@@ -1885,11 +1943,11 @@ uninstall_app() {
     pam_line="$(pam_login_line)"
 
     remove_pam_login_line || fatal "无法安全移除 SSH PAM 登录提醒，卸载已停止。"
-    systemctl disable --now vps-monitor-{collect,report,weekly,monthly}.timer >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
     systemctl disable --now vps-monitor-boot.service >/dev/null 2>&1 || true
-    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot}.service >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot,auto-update}.service >/dev/null 2>&1 || true
     systemctl stop 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
-    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer} \
+    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} \
         "${SYSTEMD_DIR}/vps-monitor-boot.service" || true
     if [[ -L "$BIN_PATH" && "$(readlink "$BIN_PATH")" == "$SCRIPT_PATH" ]]; then
         rm -f -- "$BIN_PATH" || true
@@ -1912,17 +1970,17 @@ uninstall_app() {
     if ! systemctl daemon-reload; then
         leftovers+=("systemd 配置重新加载失败")
     fi
-    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly}.{service,timer} >/dev/null 2>&1 || true
+    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} >/dev/null 2>&1 || true
     systemctl reset-failed vps-monitor-boot.service >/dev/null 2>&1 || true
     systemctl reset-failed 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
 
     for path in "$BIN_PATH" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" \
-        "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly}.{service,timer} \
+        "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} \
         "${SYSTEMD_DIR}/vps-monitor-boot.service" \
-        "${SYSTEMD_DIR}"/timers.target.wants/vps-monitor-{collect,report,weekly,monthly}.timer; do
+        "${SYSTEMD_DIR}"/timers.target.wants/vps-monitor-{collect,report,weekly,monthly,auto-update}.timer; do
         [[ ! -e "$path" && ! -L "$path" ]] || leftovers+=("$path")
     done
-    for unit in vps-monitor-{collect,report,weekly,monthly}.{service,timer}; do
+    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer}; do
         systemctl is-active --quiet "$unit" && leftovers+=("仍在运行的 systemd 单元 ${unit}")
         systemctl is-enabled --quiet "$unit" && leftovers+=("仍然启用的 systemd 单元 ${unit}")
     done
@@ -1953,7 +2011,7 @@ uninstall_app() {
 }
 
 usage() {
-    printf '用法：vps-monitor {status|doctor|test|report|weekly|monthly|collect|rename|update|uninstall|--version}\n'
+    printf '用法：vps-monitor {status|doctor|test|report|weekly|monthly|collect|rename|update|auto-update|uninstall|--version}\n'
 }
 
 main() {
@@ -1975,7 +2033,8 @@ main() {
         status) run_status ;;
         doctor) doctor_app ;;
         rename) rename_server ;;
-        update) run_update ;;
+        update) run_update manual ;;
+        auto-update) run_update automatic ;;
         __apply-update) apply_installed_update ;;
         uninstall|--uninstall) uninstall_app ;;
         --version) printf 'vps-monitor %s\n' "$VERSION" ;;
