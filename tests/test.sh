@@ -129,6 +129,114 @@ IFS=$'\t' read -r update_cursor matched_uid <<< "$(telegram_start_match "${TEST_
 assert_equal "10" "$update_cursor" "Telegram start cursor"
 assert_equal "987654321" "$matched_uid" "Telegram secure start UID"
 
+command_now=2000000000
+printf '%s\n' '{"ok":true,"result":[{"update_id":10,"message":{"date":1999999900,"text":"/reboot","from":{"id":987654321,"is_bot":false},"chat":{"id":987654321,"type":"private"}}}]}' > "${TEST_DIR}/telegram-reboot-valid.json"
+IFS=$'\t' read -r command_cursor reboot_match <<< "$(telegram_reboot_match "${TEST_DIR}/telegram-reboot-valid.json" 987654321 10 "$command_now" 180)"
+assert_equal "11" "$command_cursor" "Telegram reboot cursor"
+assert_equal "1" "$reboot_match" "authorized Telegram reboot command"
+IFS=$'\t' read -r command_cursor reboot_match <<< "$(telegram_reboot_match "${TEST_DIR}/telegram-reboot-valid.json" 987654321 11 "$command_now" 180)"
+assert_equal "11" "$command_cursor" "Telegram reboot replay cursor"
+assert_equal "0" "$reboot_match" "Telegram reboot replay prevention"
+
+printf '%s\n' '{"ok":true,"result":[{"update_id":11,"message":{"date":1999999900,"text":"/reboot","from":{"id":111111111,"is_bot":false},"chat":{"id":111111111,"type":"private"}}},{"update_id":12,"message":{"date":1999999900,"text":"/reboot","from":{"id":987654321,"is_bot":false},"chat":{"id":-100987654321,"type":"supergroup"}}},{"update_id":13,"message":{"date":1999999900,"text":"/reboot","forward_origin":{"type":"user"},"from":{"id":987654321,"is_bot":false},"chat":{"id":987654321,"type":"private"}}},{"update_id":14,"message":{"date":1999999000,"text":"/reboot","from":{"id":987654321,"is_bot":false},"chat":{"id":987654321,"type":"private"}}},{"update_id":15,"message":{"date":1999999900,"text":"/reboot now","from":{"id":987654321,"is_bot":false},"chat":{"id":987654321,"type":"private"}}},{"update_id":16,"edited_message":{"date":1999999900,"text":"/reboot","from":{"id":987654321,"is_bot":false},"chat":{"id":987654321,"type":"private"}}},{"update_id":17,"message":{"date":2000000031,"text":"/reboot","from":{"id":987654321,"is_bot":false},"chat":{"id":987654321,"type":"private"}}},{"update_id":18,"message":{"date":1999999900,"text":"/reboot","from":{"id":987654321,"is_bot":true},"chat":{"id":987654321,"type":"private"}}}]}' > "${TEST_DIR}/telegram-reboot-rejected.json"
+IFS=$'\t' read -r command_cursor reboot_match <<< "$(telegram_reboot_match "${TEST_DIR}/telegram-reboot-rejected.json" 987654321 11 "$command_now" 180)"
+assert_equal "19" "$command_cursor" "rejected Telegram commands advance cursor"
+assert_equal "0" "$reboot_match" "unauthorized Telegram reboot commands"
+printf '%s\n' '{"ok":true,"result":{}}' > "${TEST_DIR}/telegram-reboot-invalid.json"
+if telegram_reboot_match "${TEST_DIR}/telegram-reboot-invalid.json" 987654321 0 "$command_now" 180 >/dev/null 2>&1; then
+    printf 'FAIL: malformed Telegram command response was accepted\n' >&2
+    exit 1
+fi
+
+test_command_poll() (
+    CONFIG_DIR="${TEST_DIR}/command-config"
+    COMMAND_OFFSET_FILE="${CONFIG_DIR}/command_offset"
+    UPDATE_LOCK_FILE="${TEST_DIR}/command-update.lock"
+    TOKEN='123456:abcdefghijklmnopqrstuvwxyzABCDE_12345'
+    CHAT_ID=987654321
+    SERVER_NAME=测试服务器
+    WORK_DIR=""
+    mkdir -p "$CONFIG_DIR"
+    printf '10\n' > "$COMMAND_OFFSET_FILE"
+    local now command_response_fixture="${TEST_DIR}/command-poll-response.json"
+    now="$(date +%s)"
+    printf '{"ok":true,"result":[{"update_id":10,"message":{"date":%s,"text":"/reboot","from":{"id":987654321,"is_bot":false},"chat":{"id":987654321,"type":"private"}}}]}\n' "$now" > "$command_response_fixture"
+
+    # shellcheck disable=SC2317,SC2329 # Command-poll dependency stubs.
+    require_root() { :; }
+    load_config() { :; }
+    flock() { return 0; }
+    chown() { :; }
+    stat() { printf '0:0:600\n'; }
+    sync() { :; }
+    setup_api_call() { command cp -- "$command_response_fixture" "$3"; }
+    send_message() { printf '%s' "$1" > "${TEST_DIR}/command-ack"; }
+    systemctl() { printf '%s\n' "$*" >> "${TEST_DIR}/command-systemctl"; }
+
+    (run_command_poll) >/dev/null
+    assert_equal "11" "$(<"$COMMAND_OFFSET_FILE")" "successful reboot command cursor"
+    assert_equal "--no-block reboot" "$(<"${TEST_DIR}/command-systemctl")" "systemd reboot request"
+    grep -Fqx '♻️ 已收到安全重启命令，VPS 将在数秒内重启。' "${TEST_DIR}/command-ack"
+
+    printf '10\n' > "$COMMAND_OFFSET_FILE"
+    : > "${TEST_DIR}/command-systemctl"
+    systemctl() { printf '%s\n' "$*" >> "${TEST_DIR}/command-systemctl"; return 1; }
+    if (run_command_poll) >/dev/null 2>&1; then
+        printf 'FAIL: failed system reboot was reported as successful\n' >&2
+        exit 1
+    fi
+    assert_equal "10" "$(<"$COMMAND_OFFSET_FILE")" "failed reboot restores command cursor"
+
+    : > "${TEST_DIR}/command-systemctl"
+    systemctl() { printf '%s\n' "$*" >> "${TEST_DIR}/command-systemctl"; }
+    sync() { return 1; }
+    if (run_command_poll) >/dev/null 2>&1; then
+        printf 'FAIL: failed disk sync was reported as successful\n' >&2
+        exit 1
+    fi
+    assert_equal "10" "$(<"$COMMAND_OFFSET_FILE")" "failed disk sync restores command cursor"
+    [[ ! -s "${TEST_DIR}/command-systemctl" ]] \
+        || { printf 'FAIL: failed disk sync requested reboot\n' >&2; exit 1; }
+    sync() { :; }
+
+    printf '10\n' > "$COMMAND_OFFSET_FILE"
+    printf '{"ok":true,"result":[{"update_id":10,"message":{"date":%s,"text":"/reboot","from":{"id":111111111,"is_bot":false},"chat":{"id":111111111,"type":"private"}}}]}\n' "$now" > "$command_response_fixture"
+    : > "${TEST_DIR}/command-systemctl"
+    systemctl() { printf '%s\n' "$*" >> "${TEST_DIR}/command-systemctl"; }
+    assert_equal "command-poll: checked" "$(run_command_poll)" "unauthorized command poll"
+    assert_equal "11" "$(<"$COMMAND_OFFSET_FILE")" "unauthorized command advances cursor"
+    [[ ! -s "${TEST_DIR}/command-systemctl" ]] \
+        || { printf 'FAIL: unauthorized command requested reboot\n' >&2; exit 1; }
+
+    # shellcheck disable=SC2317,SC2329 # Simulates an insecure command cursor.
+    stat() { printf '0:0:640\n'; }
+    if (run_command_poll) >/dev/null 2>&1; then
+        printf 'FAIL: insecure command cursor permissions were accepted\n' >&2
+        exit 1
+    fi
+    [[ ! -s "${TEST_DIR}/command-systemctl" ]] \
+        || { printf 'FAIL: insecure command cursor requested reboot\n' >&2; exit 1; }
+)
+(test_command_poll)
+
+test_command_offset_initialization() (
+    CONFIG_DIR="${TEST_DIR}/command-init-config"
+    COMMAND_OFFSET_FILE="${CONFIG_DIR}/command_offset"
+    WORK_DIR="${TEST_DIR}/command-init-work"
+    TOKEN='123456:abcdefghijklmnopqrstuvwxyzABCDE_12345'
+    mkdir -p "$CONFIG_DIR" "$WORK_DIR"
+    printf '%s\n' '{"ok":true,"result":[{"update_id":41}]}' > "${TEST_DIR}/command-init-response.json"
+    # shellcheck disable=SC2317,SC2329 # Command cursor initialization stubs.
+    chown() { :; }
+    setup_api_call() { command cp -- "${TEST_DIR}/command-init-response.json" "$3"; }
+    initialize_command_offset
+    assert_equal "42" "$(<"$COMMAND_OFFSET_FILE")" "initial Telegram reboot cursor"
+    setup_api_call() { printf 'FAIL: valid command cursor was unnecessarily reset\n' >&2; return 1; }
+    initialize_command_offset
+    assert_equal "42" "$(<"$COMMAND_OFFSET_FILE")" "existing Telegram reboot cursor"
+)
+(test_command_offset_initialization)
+
 expected_two_hour=$'测试服务器\n进站速度: 10.15 MB/s\n出站速度: 10.07 MB/s\n总流量: 2.51 TB\nCPU利用率: 29%'
 actual_two_hour="$(format_two_hour_message 73080000000 72504000000 29 100 7200 2510000000000)"
 assert_equal "$expected_two_hour" "$actual_two_hour" "two-hour message format"
@@ -268,6 +376,8 @@ test_status() {
     load_state() { LAST_TS="$(date +%s)"; LAST_REPORT=0; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     systemctl() { [[ "${1:-}" != is-failed ]]; }
+    # shellcheck disable=SC2317,SC2329 # Simulates a secure root-only command cursor.
+    stat() { printf '0:0:600\n'; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
     sshd_pam_is_enabled() { return 0; }
     # shellcheck disable=SC2317,SC2329 # Called by the sourced status function.
@@ -277,12 +387,15 @@ test_status() {
     local SAMPLES_FILE="${DATA_DIR}/samples.tsv"
     local LOGIN_HOOK_PATH="${DATA_DIR}/login-alert-hook"
     local PAM_SSHD_FILE="${DATA_DIR}/pam-sshd"
+    local COMMAND_OFFSET_FILE="${DATA_DIR}/command_offset"
     mkdir -p "$DATA_DIR"
     printf '#!/usr/bin/env sh\nexit 0\n' > "$LOGIN_HOOK_PATH"; chmod 0700 "$LOGIN_HOOK_PATH"
     pam_login_line > "$PAM_SSHD_FILE"
+    printf '42\n' > "$COMMAND_OFFSET_FILE"
     status_output="$(run_status)"
     grep -Fqx '定时任务: 正常' <<< "$status_output"
     grep -Fqx '自动更新: 正常' <<< "$status_output"
+    grep -Fqx '远程重启: 正常' <<< "$status_output"
     grep -Fqx '登录提醒: 正常' <<< "$status_output"
     # shellcheck disable=SC2317,SC2329 # Replaces the healthy state for the stale-state check.
     load_state() { LAST_TS=0; LAST_REPORT=0; }
@@ -570,6 +683,17 @@ if grep -Eq '^(User|Group)=' "${SYSTEMD_DIR}/vps-monitor-auto-update.service"; t
     printf 'FAIL: automatic updater is not running as root\n' >&2
     exit 1
 fi
+grep -Fxq 'ExecStart=/bin/true command-poll' "${SYSTEMD_DIR}/vps-monitor-command.service"
+grep -Fxq 'OnBootSec=1min' "${SYSTEMD_DIR}/vps-monitor-command.timer"
+grep -Fxq 'OnUnitActiveSec=1min' "${SYSTEMD_DIR}/vps-monitor-command.timer"
+grep -Fxq 'NoNewPrivileges=yes' "${SYSTEMD_DIR}/vps-monitor-command.service"
+grep -Fxq 'ProtectSystem=strict' "${SYSTEMD_DIR}/vps-monitor-command.service"
+grep -Fxq 'CapabilityBoundingSet=CAP_SYS_BOOT' "${SYSTEMD_DIR}/vps-monitor-command.service"
+grep -Fxq "ReadWritePaths=${CONFIG_DIR} /run/lock" "${SYSTEMD_DIR}/vps-monitor-command.service"
+if grep -Eq '^(User|Group)=' "${SYSTEMD_DIR}/vps-monitor-command.service"; then
+    printf 'FAIL: Telegram reboot command service is not running as root\n' >&2
+    exit 1
+fi
 if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify "${SYSTEMD_DIR}"/*.service "${SYSTEMD_DIR}"/*.timer
 fi
@@ -581,6 +705,8 @@ fi
     APPLY_UPDATE_BOOT_SERVICE_EXISTED=0
     APPLY_UPDATE_AUTO_SERVICE_EXISTED=0
     APPLY_UPDATE_AUTO_TIMER_EXISTED=0
+    APPLY_UPDATE_COMMAND_SERVICE_EXISTED=0
+    APPLY_UPDATE_COMMAND_TIMER_EXISTED=0
     APPLY_UPDATE_MANAGED_MARKER_EXISTED=0
     mkdir -p "$SYSTEMD_DIR"
     : > "${SYSTEMD_DIR}/vps-monitor-weekly.service"
@@ -588,13 +714,15 @@ fi
     : > "${SYSTEMD_DIR}/vps-monitor-boot.service"
     : > "${SYSTEMD_DIR}/vps-monitor-auto-update.service"
     : > "${SYSTEMD_DIR}/vps-monitor-auto-update.timer"
+    : > "${SYSTEMD_DIR}/vps-monitor-command.service"
+    : > "${SYSTEMD_DIR}/vps-monitor-command.timer"
     MANAGED_MARKER_PATH="${SYSTEMD_DIR}/managed-marker"
     : > "$MANAGED_MARKER_PATH"
     # shellcheck disable=SC2317,SC2329 # Called by failed apply cleanup.
     systemctl() { return 0; }
     cleanup_failed_apply_units
     for unit_name in vps-monitor-weekly.{service,timer} vps-monitor-boot.service \
-        vps-monitor-auto-update.{service,timer}; do
+        vps-monitor-auto-update.{service,timer} vps-monitor-command.{service,timer}; do
         [[ ! -e "${SYSTEMD_DIR}/${unit_name}" ]] \
             || { printf 'FAIL: v1.6.2 failed apply left %s\n' "$unit_name" >&2; exit 1; }
     done
@@ -615,6 +743,8 @@ fi
     INSTALL_CREATED_SERVICE_GROUP=1
     mkdir -p "$SYSTEMD_DIR" "$(dirname -- "$BIN_PATH")" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
     : > "$BIN_PATH"; : > "$PAM_SSHD_FILE"; : > "$UPDATE_LOCK_FILE"
+    : > "${SYSTEMD_DIR}/vps-monitor-command.service"
+    : > "${SYSTEMD_DIR}/vps-monitor-command.timer"
     ensure_pam_login_line
     # shellcheck disable=SC2317,SC2329 # Called by failed install cleanup.
     systemctl() { return 0; }
@@ -627,6 +757,9 @@ fi
         [[ ! -e "$removed_path" && ! -L "$removed_path" ]] \
             || { printf 'FAIL: failed install rollback left %s\n' "$removed_path" >&2; exit 1; }
     done
+    [[ ! -e "${SYSTEMD_DIR}/vps-monitor-command.service" \
+        && ! -e "${SYSTEMD_DIR}/vps-monitor-command.timer" ]] \
+        || { printf 'FAIL: failed install rollback left Telegram command units\n' >&2; exit 1; }
     [[ -e "${ROLLBACK_ROOT}/user-removed" && -e "${ROLLBACK_ROOT}/group-removed" ]] \
         || { printf 'FAIL: failed install rollback left service account\n' >&2; exit 1; }
     grep -Fqx "$(pam_login_line)" "$PAM_SSHD_FILE" \
@@ -729,7 +862,7 @@ fi
             || { printf 'FAIL: failed update did not restore %s\n' "$unit_name" >&2; exit 1; }
     done
     for unit_name in vps-monitor-weekly.{service,timer} vps-monitor-boot.service \
-        vps-monitor-auto-update.{service,timer}; do
+        vps-monitor-auto-update.{service,timer} vps-monitor-command.{service,timer}; do
         [[ ! -e "${SYSTEMD_DIR}/${unit_name}" ]] \
             || { printf 'FAIL: failed pre-weekly update left %s\n' "$unit_name" >&2; exit 1; }
     done
@@ -751,7 +884,7 @@ fi
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         '# VPS_TELEGRAM_MONITOR_SCRIPT=1' \
-        'VERSION="1.9.0"' \
+        'VERSION="1.10.0"' \
         'if [[ "${1:-}" == "__apply-update" ]]; then : > "$REPAIR_HOOK"; fi' > "$candidate"
     cp -- "$candidate" "$SCRIPT_PATH"
     chmod 0700 "$SCRIPT_PATH" "$candidate"
@@ -799,7 +932,7 @@ fi
     UPDATE_LOCK_FILE="${AUTO_ROOT}/update.lock"
     candidate="${AUTO_ROOT}/candidate.sh"
     mkdir -p "$AUTO_ROOT"
-    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.9.0"\n' > "$SCRIPT_PATH"
+    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.10.0"\n' > "$SCRIPT_PATH"
     cp -- "$SCRIPT_PATH" "$candidate"
     chmod 0700 "$SCRIPT_PATH" "$candidate"
 
@@ -844,6 +977,7 @@ fi
     load_and_repair_config_for_doctor() { TOKEN=x; CHAT_ID=1; SERVER_NAME=测试服务器; INTERFACE=eth0; }
     ensure_bin_link() { :; }
     install_managed_marker() { :; }
+    initialize_command_offset() { : > "${DOCTOR_ROOT}/command-offset-repaired"; }
     install_systemd_units() { : > "${DOCTOR_ROOT}/units-repaired"; }
     install_login_alert_hook() { : > "${DOCTOR_ROOT}/pam-repaired"; }
     run_status() { printf 'doctor-status-ok\n'; }
@@ -858,7 +992,8 @@ fi
     grep -Fq ' collect' "${DOCTOR_ROOT}/runuser-calls"
     grep -Fq ' init-boot-alert' "${DOCTOR_ROOT}/runuser-calls"
     grep -Fq ' doctor-notify' "${DOCTOR_ROOT}/runuser-calls"
-    [[ -e "${DOCTOR_ROOT}/units-repaired" && -e "${DOCTOR_ROOT}/pam-repaired" ]] \
+    [[ -e "${DOCTOR_ROOT}/units-repaired" && -e "${DOCTOR_ROOT}/pam-repaired" \
+        && -e "${DOCTOR_ROOT}/command-offset-repaired" ]] \
         || { printf 'FAIL: doctor did not rebuild managed resources\n' >&2; exit 1; }
 )
 
@@ -893,14 +1028,14 @@ fi
 
     mkdir -p "$SYSTEMD_DIR/timers.target.wants" "$(dirname -- "$BIN_PATH")" \
         "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
-    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.9.0"\n' > "$SCRIPT_PATH"
+    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.10.0"\n' > "$SCRIPT_PATH"
     : > "$LOGIN_HOOK_PATH"; : > "$PAM_SSHD_FILE"; : > "$UPDATE_LOCK_FILE"
     ensure_pam_login_line
-    for unit_name in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer}; do
+    for unit_name in vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer}; do
         : > "${SYSTEMD_DIR}/${unit_name}"
     done
     : > "${SYSTEMD_DIR}/vps-monitor-boot.service"
-    for timer_name in vps-monitor-{collect,report,weekly,monthly,auto-update}.timer; do
+    for timer_name in vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer; do
         : > "${SYSTEMD_DIR}/timers.target.wants/${timer_name}"
     done
 
