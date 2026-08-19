@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.9.0"
+VERSION="1.10.0"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -17,6 +17,7 @@ TOKEN_FILE="${CONFIG_DIR}/token"
 CHAT_ID_FILE="${CONFIG_DIR}/chat_id"
 SERVER_NAME_FILE="${CONFIG_DIR}/server_name"
 INTERFACE_FILE="${CONFIG_DIR}/interface"
+COMMAND_OFFSET_FILE="${CONFIG_DIR}/command_offset"
 STATE_FILE="${DATA_DIR}/state.tsv"
 SAMPLES_FILE="${DATA_DIR}/samples.tsv"
 LOCK_FILE="${DATA_DIR}/monitor.lock"
@@ -36,6 +37,7 @@ WINDOW_SECONDS=7200
 MIN_COVERAGE_SECONDS=6480
 MAX_SAMPLE_SECONDS=900
 SAMPLE_RETENTION_SECONDS=21600
+COMMAND_MAX_AGE_SECONDS=180
 
 TOKEN=""
 CHAT_ID=""
@@ -69,6 +71,8 @@ APPLY_UPDATE_WEEKLY_TIMER_EXISTED=0
 APPLY_UPDATE_BOOT_SERVICE_EXISTED=0
 APPLY_UPDATE_AUTO_SERVICE_EXISTED=0
 APPLY_UPDATE_AUTO_TIMER_EXISTED=0
+APPLY_UPDATE_COMMAND_SERVICE_EXISTED=0
+APPLY_UPDATE_COMMAND_TIMER_EXISTED=0
 APPLY_UPDATE_MANAGED_MARKER_EXISTED=0
 INSTALL_IN_PROGRESS=0
 INSTALL_CREATED_SERVICE_ACCOUNT=0
@@ -101,6 +105,8 @@ cleanup_failed_apply_units() {
     systemctl stop vps-monitor-weekly.service >/dev/null 2>&1 || true
     systemctl disable --now vps-monitor-boot.service >/dev/null 2>&1 || true
     systemctl disable --now vps-monitor-auto-update.timer >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-command.timer >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-command.service >/dev/null 2>&1 || true
     if (( APPLY_UPDATE_WEEKLY_SERVICE_EXISTED == 0 )); then
         rm -f -- "${SYSTEMD_DIR}/vps-monitor-weekly.service" || true
     fi
@@ -116,6 +122,12 @@ cleanup_failed_apply_units() {
     if (( APPLY_UPDATE_AUTO_TIMER_EXISTED == 0 )); then
         rm -f -- "${SYSTEMD_DIR}/vps-monitor-auto-update.timer" || true
     fi
+    if (( APPLY_UPDATE_COMMAND_SERVICE_EXISTED == 0 )); then
+        rm -f -- "${SYSTEMD_DIR}/vps-monitor-command.service" || true
+    fi
+    if (( APPLY_UPDATE_COMMAND_TIMER_EXISTED == 0 )); then
+        rm -f -- "${SYSTEMD_DIR}/vps-monitor-command.timer" || true
+    fi
     if (( APPLY_UPDATE_MANAGED_MARKER_EXISTED == 0 )); then
         rm -f -- "$MANAGED_MARKER_PATH" || true
     fi
@@ -123,11 +135,11 @@ cleanup_failed_apply_units() {
 }
 
 cleanup_failed_install() {
-    systemctl disable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null 2>&1 || true
     systemctl disable --now vps-monitor-boot.service >/dev/null 2>&1 || true
-    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot,auto-update}.service >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot,auto-update,command}.service >/dev/null 2>&1 || true
     remove_pam_login_line >/dev/null 2>&1 || true
-    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} \
+    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer} \
         "${SYSTEMD_DIR}/vps-monitor-boot.service" "$BIN_PATH" "$UPDATE_LOCK_FILE" || true
     rm -rf -- "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" || true
     if (( INSTALL_CREATED_SERVICE_ACCOUNT == 1 )); then
@@ -147,7 +159,7 @@ cleanup_work_dir() {
         cleanup_failed_apply_units
     fi
     if (( UPDATE_TIMERS_STOPPED == 1 )) && (( EUID == 0 )) && command -v systemctl >/dev/null; then
-        systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
+        systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null 2>&1 || true
     fi
     if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
         rm -rf -- "$WORK_DIR"
@@ -611,8 +623,9 @@ format_login_message() {
 }
 
 send_message() {
-    local message="$1" request_dir curl_config message_file response_file attempt wait_seconds result=1
-    request_dir="$(mktemp -d "${DATA_DIR}/telegram.XXXXXXXX")"
+    local message="$1" request_base="${WORK_DIR:-$DATA_DIR}"
+    local request_dir curl_config message_file response_file attempt wait_seconds result=1
+    request_dir="$(mktemp -d "${request_base}/telegram.XXXXXXXX")"
     chmod 0700 "$request_dir"
     curl_config="${request_dir}/request.conf"; message_file="${request_dir}/message.txt"; response_file="${request_dir}/response.json"
     printf '%s' "$message" > "$message_file"
@@ -821,7 +834,8 @@ run_status() {
     require_root
     load_config; load_state
     local last_sample="暂无" last_report="暂无" sample_count=0 state_size=0 now
-    local login_alert="异常" boot_alert="正常" auto_update="正常" timers="正常" timer service service_result
+    local login_alert="异常" boot_alert="正常" auto_update="正常" command_control="正常"
+    local timers="正常" timer service service_result command_offset=""
     local month_total week_total current_month current_week candidate key
     local pending_months=0 pending_weeks=0 timezone
     now="$(date +%s)"
@@ -853,6 +867,17 @@ run_status() {
     fi
     service_result="$(systemctl show --property=Result --value vps-monitor-auto-update.service 2>/dev/null || printf 'unknown')"
     [[ -z "$service_result" || "$service_result" == success ]] || auto_update="异常"
+    if ! systemctl is-enabled --quiet vps-monitor-command.timer \
+        || ! systemctl is-active --quiet vps-monitor-command.timer \
+        || systemctl is-failed --quiet vps-monitor-command.service; then
+        command_control="异常"
+    fi
+    service_result="$(systemctl show --property=Result --value vps-monitor-command.service 2>/dev/null || printf 'unknown')"
+    [[ -z "$service_result" || "$service_result" == success ]] || command_control="异常"
+    if command_offset_is_secure; then
+        command_offset="$(<"$COMMAND_OFFSET_FILE")"
+    fi
+    is_uint "$command_offset" || command_control="异常"
     if (( LAST_TS == 0 || LAST_TS > now + 300 || now - LAST_TS > MAX_SAMPLE_SECONDS )); then
         timers="异常"
     fi
@@ -874,8 +899,8 @@ run_status() {
         is_week_key "$key" || continue
         [[ "$key" < "$current_week" && ! -e "${DATA_DIR}/sent-week-${key}" ]] && pending_weeks=$((pending_weeks + 1))
     done
-    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n本地时区: %s\n定时任务: %s\n自动更新: %s\n登录提醒: %s\n开机提醒: %s\n最近采样: %s\n最近汇报: %s\n本周流量: %.2f TB\n本月流量: %.2f TB\n待发周报: %s 条\n待发月报: %s 条\n短期样本: %s 条\n状态文件: %s 字节\n' \
-        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$timezone" "$timers" "$auto_update" "$login_alert" "$boot_alert" \
+    printf '程序版本: %s\n服务器名称: %s\n监控网卡: %s\n本地时区: %s\n定时任务: %s\n自动更新: %s\n远程重启: %s\n登录提醒: %s\n开机提醒: %s\n最近采样: %s\n最近汇报: %s\n本周流量: %.2f TB\n本月流量: %.2f TB\n待发周报: %s 条\n待发月报: %s 条\n短期样本: %s 条\n状态文件: %s 字节\n' \
+        "$VERSION" "$SERVER_NAME" "$INTERFACE" "$timezone" "$timers" "$auto_update" "$command_control" "$login_alert" "$boot_alert" \
         "$last_sample" "$last_report" \
         "$(awk -v value="$week_total" 'BEGIN { printf "%.2f", value/1000000000000 }')" \
         "$(awk -v value="$month_total" 'BEGIN { printf "%.2f", value/1000000000000 }')" \
@@ -903,12 +928,157 @@ telegram_updates_cursor() {
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
-        updates = json.load(handle).get("result", [])
+        payload = json.load(handle)
+    updates = payload.get("result", [])
+    if not isinstance(updates, list):
+        raise ValueError("invalid Telegram result")
     cursor = max((int(item.get("update_id", -1)) + 1 for item in updates), default=0)
-except (OSError, ValueError, TypeError, json.JSONDecodeError):
+except (AttributeError, OSError, ValueError, TypeError, json.JSONDecodeError):
     raise SystemExit(1)
 print(cursor)
 PY
+}
+
+write_command_offset() {
+    local value="$1" temporary
+    is_uint "$value" || return 1
+    temporary="$(mktemp "${CONFIG_DIR}/command-offset.XXXXXXXX")"
+    if ! printf '%s\n' "$value" > "$temporary" \
+        || ! chown root:root "$temporary" \
+        || ! chmod 0600 "$temporary" \
+        || ! mv -f -- "$temporary" "$COMMAND_OFFSET_FILE"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+command_offset_is_secure() {
+    [[ -f "$COMMAND_OFFSET_FILE" && ! -L "$COMMAND_OFFSET_FILE" \
+        && "$(stat -c '%u:%g:%a' "$COMMAND_OFFSET_FILE" 2>/dev/null)" == 0:0:600 ]]
+}
+
+initialize_command_offset() {
+    local response="${WORK_DIR}/command-offset-response.json" cursor=""
+    if [[ -f "$COMMAND_OFFSET_FILE" && ! -L "$COMMAND_OFFSET_FILE" && -r "$COMMAND_OFFSET_FILE" ]]; then
+        cursor="$(<"$COMMAND_OFFSET_FILE")"
+        if is_uint "$cursor"; then
+            if ! chown root:root "$COMMAND_OFFSET_FILE" \
+                || ! chmod 0600 "$COMMAND_OFFSET_FILE"; then
+                fatal "无法修复 Telegram 重启命令游标权限。"
+            fi
+            return 0
+        fi
+    fi
+    setup_api_call "$TOKEN" getUpdates "$response" "timeout=0" "limit=1" "offset=-1" \
+        || fatal "无法安全初始化 Telegram 重启命令；请确认机器人未被其他程序读取消息。"
+    cursor="$(telegram_updates_cursor "$response")" || fatal "无法解析 Telegram 重启命令游标。"
+    is_uint "$cursor" || fatal "Telegram 重启命令游标格式异常。"
+    write_command_offset "$cursor" || fatal "无法安全保存 Telegram 重启命令游标。"
+}
+
+telegram_reboot_match() {
+    python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import json, sys
+
+try:
+    response_path, uid_text, cursor_text, now_text, max_age_text = sys.argv[1:]
+    with open(response_path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    updates = payload.get("result", [])
+    uid = int(uid_text)
+    cursor = int(cursor_text)
+    now = int(now_text)
+    max_age = int(max_age_text)
+    if not isinstance(updates, list) or uid <= 0 or cursor < 0 or max_age <= 0:
+        raise ValueError("invalid command poll data")
+except (AttributeError, OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+reboot = False
+forward_fields = (
+    "forward_origin", "forward_from", "forward_from_chat", "forward_sender_name",
+    "forward_signature", "forward_date", "via_bot", "sender_chat", "author_signature",
+)
+for update in updates:
+    if not isinstance(update, dict):
+        continue
+    try:
+        update_id = int(update.get("update_id", -1))
+    except (ValueError, TypeError):
+        continue
+    if update_id < cursor:
+        continue
+    cursor = max(cursor, update_id + 1)
+    message = update.get("message")
+    if not isinstance(message, dict):
+        continue
+    sender = message.get("from")
+    chat = message.get("chat")
+    if not isinstance(sender, dict) or not isinstance(chat, dict):
+        continue
+    sent_at = message.get("date")
+    if not isinstance(sent_at, int) or sent_at < now - max_age or sent_at > now + 30:
+        continue
+    if any(message.get(field) is not None for field in forward_fields):
+        continue
+    if (message.get("text") == "/reboot" and chat.get("type") == "private"
+            and sender.get("is_bot") is False and sender.get("id") == uid
+            and chat.get("id") == uid):
+        reboot = True
+
+print(f"{cursor}\t{1 if reboot else 0}")
+PY
+}
+
+run_command_poll() {
+    require_root
+    exec 8>"$UPDATE_LOCK_FILE"
+    if ! flock -n 8; then
+        printf 'command-poll: update-busy-skipped\n'
+        return 0
+    fi
+    load_config
+    local old_offset parsed next_offset reboot_requested now response
+    command_offset_is_secure \
+        || fatal "Telegram 重启命令游标缺失或权限异常，请运行 sudo vps-monitor doctor。"
+    old_offset="$(<"$COMMAND_OFFSET_FILE")"
+    is_uint "$old_offset" || fatal "Telegram 重启命令游标异常，请运行 sudo vps-monitor doctor。"
+
+    WORK_DIR="$(mktemp -d -t vps-monitor-command.XXXXXXXX)"
+    chmod 0700 "$WORK_DIR"
+    trap cleanup_work_dir EXIT
+    response="${WORK_DIR}/telegram-updates.json"
+    setup_api_call "$TOKEN" getUpdates "$response" "timeout=0" "limit=100" "offset=${old_offset}" \
+        || fatal "Telegram 重启命令检查失败；Token、UID 和消息内容均未写入日志。"
+    now="$(date +%s)"
+    parsed="$(telegram_reboot_match "$response" "$CHAT_ID" "$old_offset" "$now" "$COMMAND_MAX_AGE_SECONDS")" \
+        || fatal "Telegram 重启命令数据解析失败。"
+    IFS=$'\t' read -r next_offset reboot_requested <<< "$parsed"
+    is_uint "$next_offset" || fatal "Telegram 重启命令游标格式异常。"
+    [[ "$reboot_requested" == 0 || "$reboot_requested" == 1 ]] \
+        || fatal "Telegram 重启命令结果格式异常。"
+
+    if [[ "$reboot_requested" == 0 ]]; then
+        if [[ "$next_offset" != "$old_offset" ]]; then
+            write_command_offset "$next_offset" || fatal "无法保存 Telegram 重启命令游标。"
+        fi
+        printf 'command-poll: checked\n'
+        return 0
+    fi
+
+    send_message "${SERVER_NAME}"$'\n♻️ 已收到安全重启命令，VPS 将在数秒内重启。'
+    write_command_offset "$next_offset" || fatal "无法保存已确认的 Telegram 重启命令游标，已取消重启。"
+    if ! sync; then
+        write_command_offset "$old_offset" \
+            || fatal "磁盘同步失败，且无法恢复命令游标；请立即运行 sudo vps-monitor doctor。"
+        fatal "磁盘同步失败，已取消重启并恢复命令游标。"
+    fi
+    if ! systemctl --no-block reboot; then
+        write_command_offset "$old_offset" \
+            || fatal "VPS 重启失败，且无法恢复命令游标；请立即运行 sudo vps-monitor doctor。"
+        fatal "VPS 重启请求失败，命令游标已恢复，systemd 将自动重试。"
+    fi
+    printf 'command-poll: reboot-requested\n'
 }
 
 telegram_start_match() {
@@ -1496,7 +1666,48 @@ Unit=vps-monitor-auto-update.service
 [Install]
 WantedBy=timers.target
 EOF
-    chmod 0644 "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer}
+    cat > "${SYSTEMD_DIR}/vps-monitor-command.service" <<EOF
+[Unit]
+Description=Process authorized Telegram reboot command
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=${BIN_PATH} command-poll
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_SYS_BOOT
+ReadWritePaths=${CONFIG_DIR} /run/lock
+TimeoutStartSec=4min
+StandardOutput=null
+StandardError=journal
+EOF
+    cat > "${SYSTEMD_DIR}/vps-monitor-command.timer" <<EOF
+[Unit]
+Description=Check authorized Telegram commands every minute
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=vps-monitor-command.service
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 0644 "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer}
     chmod 0644 "${SYSTEMD_DIR}/vps-monitor-boot.service"
 }
 
@@ -1514,7 +1725,7 @@ ensure_bin_link() {
 
 assert_fresh_install_targets() {
     local unit
-    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} vps-monitor-boot.service; do
+    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer} vps-monitor-boot.service; do
         [[ ! -e "${SYSTEMD_DIR}/${unit}" && ! -L "${SYSTEMD_DIR}/${unit}" ]] \
             || fatal "检测到同名 systemd 单元 ${unit}，为避免影响原有服务，安装已停止。"
     done
@@ -1590,7 +1801,7 @@ install_app() {
         fatal "无法创建专用系统账户，安装将自动回滚。"
     fi
     INSTALL_CREATED_SERVICE_ACCOUNT=1
-    systemctl stop vps-monitor-{collect,report,weekly,monthly,auto-update}.{timer,service} >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{timer,service} >/dev/null 2>&1 || true
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
     printf '%s' "$setup_token" > "${WORK_DIR}/token"
@@ -1602,17 +1813,20 @@ install_app() {
     install -o root -g "$SERVICE_USER" -m 0640 "${WORK_DIR}/server_name" "$SERVER_NAME_FILE"
     install -o root -g "$SERVICE_USER" -m 0640 "${WORK_DIR}/interface" "$INTERFACE_FILE"
     chown -hR -- "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
+    load_config
+    initialize_command_offset
 
     install_systemd_units
     install_login_alert_hook
     systemctl daemon-reload
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
-    systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null
+    systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null
     systemctl enable vps-monitor-boot.service >/dev/null
     INSTALL_IN_PROGRESS=0
-    success "安装完成，Telegram 安全启动链接与 SSH 登录提醒已验证"
+    success "安装完成，Telegram 安全启动链接、远程重启与 SSH 登录提醒已验证"
     printf '\n以后无需操作：每 5 分钟轻量采集，每 2 小时汇报，每周一发送带环比的周报，每月发送月报；每天安全检查 GitHub 更新，VPS 重启恢复和 SSH 登录成功时立即提醒。\n'
+    printf '在机器人私聊中发送 /reboot，可由绑定 UID 安全快速重启本机。\n'
     printf '查看状态：sudo vps-monitor status\n查看日志：sudo journalctl -u "vps-monitor-*" --since today\n\n'
     warn "Token 与 UID 仅保存在受限配置文件中，日志不会输出这些信息。"
 }
@@ -1629,6 +1843,8 @@ apply_installed_update() {
     [[ -e "${SYSTEMD_DIR}/vps-monitor-boot.service" ]] && APPLY_UPDATE_BOOT_SERVICE_EXISTED=1
     [[ -e "${SYSTEMD_DIR}/vps-monitor-auto-update.service" ]] && APPLY_UPDATE_AUTO_SERVICE_EXISTED=1
     [[ -e "${SYSTEMD_DIR}/vps-monitor-auto-update.timer" ]] && APPLY_UPDATE_AUTO_TIMER_EXISTED=1
+    [[ -e "${SYSTEMD_DIR}/vps-monitor-command.service" ]] && APPLY_UPDATE_COMMAND_SERVICE_EXISTED=1
+    [[ -e "${SYSTEMD_DIR}/vps-monitor-command.timer" ]] && APPLY_UPDATE_COMMAND_TIMER_EXISTED=1
     [[ -e "$MANAGED_MARKER_PATH" ]] && APPLY_UPDATE_MANAGED_MARKER_EXISTED=1
     APPLY_UPDATE_IN_PROGRESS=1
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
@@ -1636,13 +1852,14 @@ apply_installed_update() {
     chown root:"$SERVICE_USER" "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
     chmod 0640 "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
     chown -hR -- "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
+    initialize_command_offset
     ensure_bin_link
     install_managed_marker
     install_systemd_units
     install_login_alert_hook
     systemctl daemon-reload
     runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
-    systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null
+    systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null
     systemctl enable vps-monitor-boot.service >/dev/null
     APPLY_UPDATE_IN_PROGRESS=0
 }
@@ -1656,7 +1873,7 @@ restore_update_backup() {
     else
         rm -f -- "$LOGIN_HOOK_PATH" || return 1
     fi
-    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} vps-monitor-boot.service; do
+    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer} vps-monitor-boot.service; do
         if [[ -f "${backup_dir}/units/${unit}" ]]; then
             install -o root -g root -m 0644 "${backup_dir}/units/${unit}" "${SYSTEMD_DIR}/${unit}" || return 1
         else
@@ -1669,7 +1886,7 @@ restore_update_backup() {
     fi
     ln -sfn "$SCRIPT_PATH" "$BIN_PATH" || return 1
     systemctl daemon-reload || return 1
-    for component in collect report weekly monthly auto-update; do
+    for component in collect report weekly monthly auto-update command; do
         if [[ -f "${SYSTEMD_DIR}/vps-monitor-${component}.service" \
             && -f "${SYSTEMD_DIR}/vps-monitor-${component}.timer" ]]; then
             timers_to_enable+=("vps-monitor-${component}.timer")
@@ -1729,7 +1946,7 @@ run_update() {
     if [[ -f "$LOGIN_HOOK_PATH" ]]; then
         cp -p -- "$LOGIN_HOOK_PATH" "${backup_dir}/login-alert-hook"
     fi
-    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} vps-monitor-boot.service; do
+    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer} vps-monitor-boot.service; do
         if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
             cp -p -- "${SYSTEMD_DIR}/${unit}" "${backup_dir}/units/${unit}"
         fi
@@ -1738,17 +1955,17 @@ run_update() {
         pam_line_was_present=1
     fi
 
-    systemctl stop vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null 2>&1 || true
     UPDATE_TIMERS_STOPPED=1
     local wait_deadline=$((SECONDS + 240)) active_service
     while :; do
         active_service=0
-        for unit in vps-monitor-{collect,report,weekly,monthly,boot}.service; do
+        for unit in vps-monitor-{collect,report,weekly,monthly,boot,command}.service; do
             systemctl is-active --quiet "$unit" && active_service=1
         done
         (( active_service == 0 )) && break
         if (( SECONDS >= wait_deadline )); then
-            systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
+            systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null 2>&1 || true
             fatal "监控任务长时间未结束，更新已取消，现有程序未被修改。"
         fi
         sleep 1
@@ -1819,6 +2036,7 @@ rebind_telegram_for_doctor() {
     new_chat_id="$(resolve_telegram_uid "$new_token")"
     write_config_value "$TOKEN_FILE" "$new_token" || fatal "无法保存修复后的 Token。"
     write_config_value "$CHAT_ID_FILE" "$new_chat_id" || fatal "无法保存修复后的 UID。"
+    rm -f -- "$COMMAND_OFFSET_FILE" || fatal "无法重置 Telegram 重启命令游标。"
     TOKEN="$new_token"; CHAT_ID="$new_chat_id"
     success "Telegram Token 与 UID 已重新安全绑定"
 }
@@ -1862,20 +2080,20 @@ doctor_app() {
     ensure_service_account_for_doctor
     install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
-    load_and_repair_config_for_doctor
 
-    systemctl stop vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null 2>&1 || true
     UPDATE_TIMERS_STOPPED=1
     local deadline=$((SECONDS + 240)) unit active
     while :; do
         active=0
-        for unit in vps-monitor-{collect,report,weekly,monthly,boot}.service; do
+        for unit in vps-monitor-{collect,report,weekly,monthly,boot,command}.service; do
             systemctl is-active --quiet "$unit" && active=1
         done
         (( active == 0 )) && break
         (( SECONDS < deadline )) || fatal "监控任务长时间未结束，doctor 已停止以避免破坏正在写入的数据。"
         sleep 1
     done
+    load_and_repair_config_for_doctor
 
     info "正在修复文件权限、命令入口和统计状态……"
     chown root:root "$SCRIPT_PATH"; chmod 0755 "$SCRIPT_PATH"
@@ -1885,18 +2103,6 @@ doctor_app() {
     chmod 0640 "$TOKEN_FILE" "$CHAT_ID_FILE" "$SERVER_NAME_FILE" "$INTERFACE_FILE"
     chown -hR -- "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
 
-    info "正在重建 systemd 定时任务与 SSH 登录提醒……"
-    install_systemd_units
-    install_login_alert_hook
-    systemctl daemon-reload
-    runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
-    runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
-    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly,boot,auto-update}.service \
-        vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
-    systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null
-    systemctl enable vps-monitor-boot.service >/dev/null
-    UPDATE_TIMERS_STOPPED=0
-
     info "正在验证 Telegram 通知链路……"
     if ! runuser -u "$SERVICE_USER" -- "$BIN_PATH" doctor-notify >/dev/null; then
         warn "Telegram 通知验证失败，可能是 Token 失效、机器人被停止或网络异常。"
@@ -1904,6 +2110,19 @@ doctor_app() {
         runuser -u "$SERVICE_USER" -- "$BIN_PATH" doctor-notify >/dev/null \
             || fatal "重新绑定后仍无法发送 Telegram 消息，请检查 VPS 网络和 Telegram 可用性。"
     fi
+    initialize_command_offset
+
+    info "正在重建 systemd 定时任务与 SSH 登录提醒……"
+    install_systemd_units
+    install_login_alert_hook
+    systemctl daemon-reload
+    runuser -u "$SERVICE_USER" -- "$BIN_PATH" collect >/dev/null
+    runuser -u "$SERVICE_USER" -- "$BIN_PATH" init-boot-alert >/dev/null
+    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly,boot,auto-update,command}.service \
+        vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null 2>&1 || true
+    systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null
+    systemctl enable vps-monitor-boot.service >/dev/null
+    UPDATE_TIMERS_STOPPED=0
     success "自检和一键修复完成"
     run_status
 }
@@ -1926,7 +2145,7 @@ rename_server() {
         fatal "服务器名称保存失败，原配置未被修改。"
     fi
     success "服务器名称已修改为：${new_name}"
-    printf '下一次测速汇报、周报、月报、开机提醒和登录提醒将使用新名称。\n'
+    printf '下一次测速汇报、周报、月报、远程重启确认、开机提醒和登录提醒将使用新名称。\n'
 }
 
 uninstall_app() {
@@ -1943,11 +2162,11 @@ uninstall_app() {
     pam_line="$(pam_login_line)"
 
     remove_pam_login_line || fatal "无法安全移除 SSH PAM 登录提醒，卸载已停止。"
-    systemctl disable --now vps-monitor-{collect,report,weekly,monthly,auto-update}.timer >/dev/null 2>&1 || true
+    systemctl disable --now vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null 2>&1 || true
     systemctl disable --now vps-monitor-boot.service >/dev/null 2>&1 || true
-    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot,auto-update}.service >/dev/null 2>&1 || true
+    systemctl stop vps-monitor-{collect,report,weekly,monthly,boot,auto-update,command}.service >/dev/null 2>&1 || true
     systemctl stop 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
-    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} \
+    rm -f -- "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer} \
         "${SYSTEMD_DIR}/vps-monitor-boot.service" || true
     if [[ -L "$BIN_PATH" && "$(readlink "$BIN_PATH")" == "$SCRIPT_PATH" ]]; then
         rm -f -- "$BIN_PATH" || true
@@ -1970,17 +2189,17 @@ uninstall_app() {
     if ! systemctl daemon-reload; then
         leftovers+=("systemd 配置重新加载失败")
     fi
-    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} >/dev/null 2>&1 || true
+    systemctl reset-failed vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer} >/dev/null 2>&1 || true
     systemctl reset-failed vps-monitor-boot.service >/dev/null 2>&1 || true
     systemctl reset-failed 'vps-monitor-login-alert-*.service' >/dev/null 2>&1 || true
 
     for path in "$BIN_PATH" "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" \
-        "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer} \
+        "${SYSTEMD_DIR}"/vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer} \
         "${SYSTEMD_DIR}/vps-monitor-boot.service" \
-        "${SYSTEMD_DIR}"/timers.target.wants/vps-monitor-{collect,report,weekly,monthly,auto-update}.timer; do
+        "${SYSTEMD_DIR}"/timers.target.wants/vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer; do
         [[ ! -e "$path" && ! -L "$path" ]] || leftovers+=("$path")
     done
-    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update}.{service,timer}; do
+    for unit in vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer}; do
         systemctl is-active --quiet "$unit" && leftovers+=("仍在运行的 systemd 单元 ${unit}")
         systemctl is-enabled --quiet "$unit" && leftovers+=("仍然启用的 systemd 单元 ${unit}")
     done
@@ -2030,6 +2249,7 @@ main() {
         boot-alert) run_boot_alert ;;
         init-boot-alert) initialize_boot_alert_state ;;
         doctor-notify) run_doctor_message ;;
+        command-poll) run_command_poll ;;
         status) run_status ;;
         doctor) doctor_app ;;
         rename) rename_server ;;

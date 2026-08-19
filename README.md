@@ -25,6 +25,8 @@ sudo vps-monitor uninstall    # 完全卸载
 
 安装后每天会自动安全检查 GitHub 更新，无需手动操作。
 
+在与机器人私聊中发送 `/reboot`，可由安装时绑定的 UID 安全快速重启 VPS。
+
 安装损坏、命令入口缺失时的一键卸载：
 
 ```bash
