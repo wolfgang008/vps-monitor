@@ -168,7 +168,7 @@ test_command_poll() (
     flock() { return 0; }
     chown() { :; }
     stat() { printf '0:0:600\n'; }
-    sync() { :; }
+    sync() { printf '%s\n' "$*" > "${TEST_DIR}/command-sync"; }
     setup_api_call() { command cp -- "$command_response_fixture" "$3"; }
     send_message() { printf '%s' "$1" > "${TEST_DIR}/command-ack"; }
     systemctl() { printf '%s\n' "$*" >> "${TEST_DIR}/command-systemctl"; }
@@ -176,6 +176,7 @@ test_command_poll() (
     (run_command_poll) >/dev/null
     assert_equal "11" "$(<"$COMMAND_OFFSET_FILE")" "successful reboot command cursor"
     assert_equal "--no-block reboot" "$(<"${TEST_DIR}/command-systemctl")" "systemd reboot request"
+    assert_equal "${COMMAND_OFFSET_FILE} ${CONFIG_DIR}" "$(<"${TEST_DIR}/command-sync")" "targeted reboot disk sync"
     grep -Fqx '♻️ 已收到安全重启命令，VPS 将在数秒内重启。' "${TEST_DIR}/command-ack"
 
     printf '10\n' > "$COMMAND_OFFSET_FILE"
@@ -237,6 +238,24 @@ test_command_offset_initialization() (
 )
 (test_command_offset_initialization)
 
+test_telegram_delivery_probe() (
+    WORK_DIR="${TEST_DIR}/telegram-probe"
+    TOKEN='123456:abcdefghijklmnopqrstuvwxyzABCDE_12345'
+    CHAT_ID=123456789
+    mkdir -p "$WORK_DIR"
+    # shellcheck disable=SC2317,SC2329 # Captures the non-message Telegram delivery probe.
+    setup_api_call() {
+        printf '%s\n' "$*" > "${TEST_DIR}/telegram-probe-call"
+        : > "$3"
+    }
+
+    telegram_delivery_ready
+    assert_equal \
+        "${TOKEN} sendChatAction ${WORK_DIR}/telegram-delivery-probe.json chat_id=${CHAT_ID} action=typing" \
+        "$(<"${TEST_DIR}/telegram-probe-call")" "non-message Telegram delivery probe"
+)
+(test_telegram_delivery_probe)
+
 expected_two_hour=$'测试服务器\n进站速度: 10.15 MB/s\n出站速度: 10.07 MB/s\n总流量: 2.51 TB\nCPU利用率: 29%'
 actual_two_hour="$(format_two_hour_message 73080000000 72504000000 29 100 7200 2510000000000)"
 assert_equal "$expected_two_hour" "$actual_two_hour" "two-hour message format"
@@ -295,6 +314,25 @@ extract_verified_main_archive "${TEST_DIR}/main.tar.gz" \
     "${TEST_DIR}/archive-script" "${TEST_DIR}/archive-checksum" \
     || { printf 'FAIL: valid GitHub main archive was rejected\n' >&2; exit 1; }
 assert_equal "9.8.7" "$(script_version "${TEST_DIR}/archive-script")" "GitHub main archive script"
+archive_size="$(stat -c '%s' "${TEST_DIR}/main.tar.gz")"
+file_size_within_limit "${TEST_DIR}/main.tar.gz" "$archive_size" \
+    || { printf 'FAIL: valid archive size was rejected\n' >&2; exit 1; }
+if file_size_within_limit "${TEST_DIR}/main.tar.gz" "$((archive_size - 1))"; then
+    printf 'FAIL: oversized archive was accepted\n' >&2
+    exit 1
+fi
+if (MAX_ARCHIVE_BYTES=1; extract_verified_main_archive "${TEST_DIR}/main.tar.gz" \
+        "${TEST_DIR}/oversized-archive-script" "${TEST_DIR}/oversized-archive-checksum") >/dev/null 2>&1; then
+    printf 'FAIL: archive extraction ignored the size limit\n' >&2
+    exit 1
+fi
+if (MAX_SCRIPT_BYTES=8; extract_verified_main_archive "${TEST_DIR}/main.tar.gz" \
+        "${TEST_DIR}/oversized-member-script" "${TEST_DIR}/oversized-member-checksum") >/dev/null 2>&1; then
+    printf 'FAIL: oversized archive member was accepted\n' >&2
+    exit 1
+fi
+[[ "$(wc -c < "${TEST_DIR}/oversized-member-script")" -le 9 ]] \
+    || { printf 'FAIL: oversized archive member was not output-capped\n' >&2; exit 1; }
 
 login_epoch="$(date -d '2026-08-05 12:34:56 UTC' +%s)"
 login_time="$(date -d "@${login_epoch}" '+%F %T %Z')"
@@ -302,16 +340,23 @@ expected_login="$(printf '⚠️ VPS 登录提醒\n服务器: 测试服务器\n�
 actual_login="$(format_login_message root 203.0.113.8 "$login_epoch")"
 assert_equal "$expected_login" "$actual_login" "SSH login alert format"
 
-(
+test_login_alert_delivery() (
+    DATA_DIR="${TEST_DIR}/login-alert"
+    mkdir -p "$DATA_DIR"
     load_config() { :; }
     # shellcheck disable=SC2317,SC2329 # Must remain unused by the login-alert path.
     acquire_lock() { printf 'FAIL: login alert used the statistics lock\n' >&2; return 1; }
-    send_message() { printf '%s' "$1" > "${TEST_DIR}/captured-login-alert"; }
-    VPS_LOGIN_USER=root VPS_LOGIN_IP=203.0.113.8 run_login_alert >/dev/null
+    send_message() {
+        printf '%s' "$1" > "${DATA_DIR}/captured-login-alert"
+        printf 'sent\n' >> "${DATA_DIR}/send-count"
+    }
+    assert_equal "login-alert: sent" "$(VPS_LOGIN_USER=root VPS_LOGIN_IP=203.0.113.8 run_login_alert)" "SSH login alert delivery"
+    login_prefix=$'⚠️ VPS 登录提醒\n服务器: 测试服务器\n登录用户: root\n来源IP: 203.0.113.8\n登录时间: '
+    [[ "$(<"${DATA_DIR}/captured-login-alert")" == "${login_prefix}"* ]] \
+        || { printf 'FAIL: SSH login alert message\n' >&2; exit 1; }
+    assert_equal "1" "$(wc -l < "${DATA_DIR}/send-count")" "SSH login send count"
 )
-login_prefix=$'⚠️ VPS 登录提醒\n服务器: 测试服务器\n登录用户: root\n来源IP: 203.0.113.8\n登录时间: '
-[[ "$(<"${TEST_DIR}/captured-login-alert")" == "${login_prefix}"* ]] \
-    || { printf 'FAIL: SSH login alert delivery\n' >&2; exit 1; }
+(test_login_alert_delivery)
 
 test_boot_alert_delivery() (
     DATA_DIR="${TEST_DIR}/boot-alert"
@@ -345,6 +390,9 @@ sh -n "${TEST_DIR}/login-alert-hook"
 grep -Fq -- '--no-block' "${TEST_DIR}/login-alert-hook"
 grep -Fq -- '/usr/bin/date +%s%N' "${TEST_DIR}/login-alert-hook"
 grep -Fq -- "VPS_LOGIN_IP=\$PAM_RHOST" "${TEST_DIR}/login-alert-hook"
+grep -Fq -- '--property=MemoryMax=64M' "${TEST_DIR}/login-alert-hook"
+grep -Fq -- '--property=TasksMax=16' "${TEST_DIR}/login-alert-hook"
+grep -Fq -- '--property=StandardOutput=null' "${TEST_DIR}/login-alert-hook"
 
 SSHD_BIN="${TEST_DIR}/sshd"
 printf '#!/usr/bin/env sh\nprintf "usepam yes\\n"\n' > "$SSHD_BIN"
@@ -884,7 +932,7 @@ fi
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         '# VPS_TELEGRAM_MONITOR_SCRIPT=1' \
-        'VERSION="1.10.0"' \
+        'VERSION="1.10.1"' \
         'if [[ "${1:-}" == "__apply-update" ]]; then : > "$REPAIR_HOOK"; fi' > "$candidate"
     cp -- "$candidate" "$SCRIPT_PATH"
     chmod 0700 "$SCRIPT_PATH" "$candidate"
@@ -932,7 +980,7 @@ fi
     UPDATE_LOCK_FILE="${AUTO_ROOT}/update.lock"
     candidate="${AUTO_ROOT}/candidate.sh"
     mkdir -p "$AUTO_ROOT"
-    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.10.0"\n' > "$SCRIPT_PATH"
+    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.10.1"\n' > "$SCRIPT_PATH"
     cp -- "$SCRIPT_PATH" "$candidate"
     chmod 0700 "$SCRIPT_PATH" "$candidate"
 
@@ -977,8 +1025,12 @@ fi
     load_and_repair_config_for_doctor() { TOKEN=x; CHAT_ID=1; SERVER_NAME=测试服务器; INTERFACE=eth0; }
     ensure_bin_link() { :; }
     install_managed_marker() { :; }
+    telegram_delivery_ready() { : > "${DOCTOR_ROOT}/telegram-probed"; }
     initialize_command_offset() { : > "${DOCTOR_ROOT}/command-offset-repaired"; }
-    install_systemd_units() { : > "${DOCTOR_ROOT}/units-repaired"; }
+    install_systemd_units() {
+        : > "${DOCTOR_ROOT}/units-repaired"
+        printf 'units\n' >> "${DOCTOR_ROOT}/events"
+    }
     install_login_alert_hook() { : > "${DOCTOR_ROOT}/pam-repaired"; }
     run_status() { printf 'doctor-status-ok\n'; }
     flock() { return 0; }
@@ -986,13 +1038,19 @@ fi
     chown() { return 0; }
     chmod() { return 0; }
     systemctl() { [[ "${1:-}" != is-active ]]; }
-    runuser() { printf '%s\n' "$*" >> "${DOCTOR_ROOT}/runuser-calls"; }
+    runuser() {
+        printf '%s\n' "$*" >> "${DOCTOR_ROOT}/runuser-calls"
+        [[ "$*" == *doctor-notify* ]] && printf 'notify\n' >> "${DOCTOR_ROOT}/events"
+        return 0
+    }
     doctor_output="$(doctor_app)"
     grep -Fq '[完成] 自检和一键修复完成' <<< "$doctor_output"
     grep -Fq ' collect' "${DOCTOR_ROOT}/runuser-calls"
     grep -Fq ' init-boot-alert' "${DOCTOR_ROOT}/runuser-calls"
     grep -Fq ' doctor-notify' "${DOCTOR_ROOT}/runuser-calls"
+    assert_equal $'units\nnotify' "$(<"${DOCTOR_ROOT}/events")" "doctor completion notification ordering"
     [[ -e "${DOCTOR_ROOT}/units-repaired" && -e "${DOCTOR_ROOT}/pam-repaired" \
+        && -e "${DOCTOR_ROOT}/telegram-probed" \
         && -e "${DOCTOR_ROOT}/command-offset-repaired" ]] \
         || { printf 'FAIL: doctor did not rebuild managed resources\n' >&2; exit 1; }
 )
@@ -1028,7 +1086,7 @@ fi
 
     mkdir -p "$SYSTEMD_DIR/timers.target.wants" "$(dirname -- "$BIN_PATH")" \
         "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
-    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.10.0"\n' > "$SCRIPT_PATH"
+    printf '#!/usr/bin/env bash\n# VPS_TELEGRAM_MONITOR_SCRIPT=1\nVERSION="1.10.1"\n' > "$SCRIPT_PATH"
     : > "$LOGIN_HOOK_PATH"; : > "$PAM_SSHD_FILE"; : > "$UPDATE_LOCK_FILE"
     ensure_pam_login_line
     for unit_name in vps-monitor-{collect,report,weekly,monthly,auto-update,command}.{service,timer}; do
