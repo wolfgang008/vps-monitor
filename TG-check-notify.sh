@@ -4,7 +4,7 @@ set -Eeuo pipefail
 export LC_NUMERIC=C
 umask 077
 
-VERSION="1.10.0"
+VERSION="1.10.1"
 APP_NAME="vps-monitor"
 SERVICE_USER="vpsmonitor"
 INSTALL_DIR="/usr/local/lib/${APP_NAME}"
@@ -38,6 +38,9 @@ MIN_COVERAGE_SECONDS=6480
 MAX_SAMPLE_SECONDS=900
 SAMPLE_RETENTION_SECONDS=21600
 COMMAND_MAX_AGE_SECONDS=180
+MAX_ARCHIVE_BYTES=5242880
+MAX_SCRIPT_BYTES=1048576
+MAX_CHECKSUM_BYTES=4096
 
 TOKEN=""
 CHAT_ID=""
@@ -923,6 +926,12 @@ setup_api_call() {
         && grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$response"
 }
 
+telegram_delivery_ready() {
+    local response="${WORK_DIR}/telegram-delivery-probe.json"
+    setup_api_call "$TOKEN" sendChatAction "$response" \
+        "chat_id=${CHAT_ID}" "action=typing"
+}
+
 telegram_updates_cursor() {
     python3 - "$1" <<'PY'
 import json, sys
@@ -1068,7 +1077,7 @@ run_command_poll() {
 
     send_message "${SERVER_NAME}"$'\n♻️ 已收到安全重启命令，VPS 将在数秒内重启。'
     write_command_offset "$next_offset" || fatal "无法保存已确认的 Telegram 重启命令游标，已取消重启。"
-    if ! sync; then
+    if ! sync "$COMMAND_OFFSET_FILE" "$CONFIG_DIR"; then
         write_command_offset "$old_offset" \
             || fatal "磁盘同步失败，且无法恢复命令游标；请立即运行 sudo vps-monitor doctor。"
         fatal "磁盘同步失败，已取消重启并恢复命令游标。"
@@ -1211,7 +1220,11 @@ esac
     --property=RestrictNamespaces=yes \
     --property="RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" \
     --property=ReadWritePaths=/var/lib/vps-monitor \
+    --property=MemoryMax=64M \
+    --property=TasksMax=16 \
     --property=TimeoutStartSec=3min \
+    --property=StandardOutput=null \
+    --property=StandardError=journal \
     --setenv="VPS_LOGIN_USER=$PAM_USER" \
     --setenv="VPS_LOGIN_IP=$PAM_RHOST" \
     /usr/local/bin/vps-monitor login-alert >/dev/null 2>&1 || true
@@ -1383,6 +1396,21 @@ version_is_newer() {
             && 10#$candidate_patch > 10#$installed_patch) ))
 }
 
+file_size_within_limit() {
+    local file="$1" limit="$2" size
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    size="$(stat -c '%s' "$file" 2>/dev/null)" || return 1
+    is_uint "$size" && is_uint "$limit" && (( size > 0 && size <= limit ))
+}
+
+extract_archive_member_limited() {
+    local archive_file="$1" member="$2" output_file="$3" limit="$4"
+    is_uint "$limit" && (( limit > 0 )) || return 1
+    tar -xOzf "$archive_file" "$member" | head -c "$((limit + 1))" > "$output_file" \
+        || return 1
+    file_size_within_limit "$output_file" "$limit"
+}
+
 verify_downloaded_script() {
     local script_file="$1" checksum_file="$2" expected listed extra actual
     local -a checksum_lines=()
@@ -1401,8 +1429,11 @@ verify_downloaded_script() {
 
 extract_verified_main_archive() {
     local archive_file="$1" output_file="$2" checksum_file="$3"
-    tar -xOzf "$archive_file" "${GITHUB_ARCHIVE_ROOT}/TG-check-notify.sh" > "$output_file" \
-        && tar -xOzf "$archive_file" "${GITHUB_ARCHIVE_ROOT}/TG-check-notify.sh.sha256" > "$checksum_file" \
+    file_size_within_limit "$archive_file" "$MAX_ARCHIVE_BYTES" \
+        && extract_archive_member_limited "$archive_file" \
+            "${GITHUB_ARCHIVE_ROOT}/TG-check-notify.sh" "$output_file" "$MAX_SCRIPT_BYTES" \
+        && extract_archive_member_limited "$archive_file" \
+            "${GITHUB_ARCHIVE_ROOT}/TG-check-notify.sh.sha256" "$checksum_file" "$MAX_CHECKSUM_BYTES" \
         && verify_downloaded_script "$output_file" "$checksum_file"
 }
 
@@ -1412,6 +1443,7 @@ download_verified_main() {
     for attempt in 1 2 3; do
         rm -f -- "$output_file" "$checksum_file" "$archive_file"
         if curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 \
+                --max-filesize "$MAX_ARCHIVE_BYTES" \
                 --connect-timeout 10 --max-time 60 "$GITHUB_ARCHIVE_URL" -o "$archive_file" \
             && extract_verified_main_archive "$archive_file" "$output_file" "$checksum_file"; then
             chmod 0700 "$output_file"
@@ -2104,10 +2136,10 @@ doctor_app() {
     chown -hR -- "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"; chmod 0750 "$DATA_DIR"
 
     info "正在验证 Telegram 通知链路……"
-    if ! runuser -u "$SERVICE_USER" -- "$BIN_PATH" doctor-notify >/dev/null; then
+    if ! telegram_delivery_ready; then
         warn "Telegram 通知验证失败，可能是 Token 失效、机器人被停止或网络异常。"
         rebind_telegram_for_doctor
-        runuser -u "$SERVICE_USER" -- "$BIN_PATH" doctor-notify >/dev/null \
+        telegram_delivery_ready \
             || fatal "重新绑定后仍无法发送 Telegram 消息，请检查 VPS 网络和 Telegram 可用性。"
     fi
     initialize_command_offset
@@ -2123,6 +2155,8 @@ doctor_app() {
     systemctl enable --now vps-monitor-{collect,report,weekly,monthly,auto-update,command}.timer >/dev/null
     systemctl enable vps-monitor-boot.service >/dev/null
     UPDATE_TIMERS_STOPPED=0
+    runuser -u "$SERVICE_USER" -- "$BIN_PATH" doctor-notify >/dev/null \
+        || fatal "修复已完成，但 Telegram 完成通知发送失败，请检查 VPS 网络后再次运行 doctor。"
     success "自检和一键修复完成"
     run_status
 }
